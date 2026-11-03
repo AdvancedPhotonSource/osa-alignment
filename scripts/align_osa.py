@@ -311,12 +311,13 @@ class Controller:
         description = (f"Image {obs['acquisition']} at {obs['position']}: fit "
             f"{'valid' if m['valid'] else 'invalid'}; "
             f"inner/outer coverage={m.get('inner_coverage', 0):.3f}/{m.get('outer_coverage', 0):.3f}; "
-            f"M1={float(m['primary_metric']):.5g}, hole integral M2={float(m['secondary_metric']):.6g}; "
+            f"M1={float(m['primary_metric']):.5g}, M2={float(m['secondary_metric']):.6g}; "
             f"Reasons: {', '.join(m['reasons']) or 'none'}.")
         if m.get("fit") is not None:
             description += (f" Unsupported arcs reach {m.get('inner_max_gap_degrees', float('nan')):.1f}"
                             f" degrees inside and {m.get('outer_max_gap_degrees', float('nan')):.1f} outside."
-                            f" Hole mean={m.get('hole_mean', float('nan')):.5g}.")
+                            f" Hole mean={m.get('hole_mean', float('nan')):.5g}."
+                            f" Hole centroid offset={m.get('hole_centroid_offset_px', float('nan')):.3g} px.")
         if obs.get("appearance"):
             a = obs["appearance"]
             description += f" Ring sector means={a['ring_sector_means']}; hole peak={a['hole_peak']}."

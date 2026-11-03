@@ -116,19 +116,32 @@ boundary RMS distance is 2% of the outer equal-area radius. With incomplete
 coverage, the score also includes the missing-arc penalty. M1 does not directly
 measure angular brightness balance or contamination inside the hole.
 
-**M2 (`secondary_metric`) measures integrated signal inside the fitted hole.**
+**M2 (`secondary_metric`) measures integrated signal inside the fitted hole and
+how far off center that signal sits.**
 
 \[
-M_2 = \frac{1}{S}\sum_{p\,\mathrm{inside\ inner\ ellipse}} (I_p-B),
+M_2 = \frac{1}{S}\left(\sum_{p\,\mathrm{inside\ inner\ ellipse}} (I_p-B)\right)
+      \left(1 + w\,\frac{d}{r_i}\right),
 \]
 
 where \(B\) is the configured scalar background and \(S\) is the intensity
-normalizer (defaults: 0 and 1). This is a pixel sum, not mean intensity or a
-hole-to-ring ratio. Lower M2 means less residual central signal under comparable
+normalizer (defaults: 0 and 1). The first factor is a pixel sum, not mean intensity
+or a hole-to-ring ratio. Lower M2 means less residual central signal under comparable
 conditions. Its scale depends on image intensity units, exposure, normalization,
 and hole area; it has no universal acceptable cutoff. Fixed semiaxes and consistent
-acquisition settings make comparisons meaningful. A low sum can still conceal
-a localized bright spot.
+acquisition settings make comparisons meaningful.
+
+The second factor penalizes asymmetry. \(d\) is the distance from the inner ellipse
+center to the intensity-weighted centroid of the hole, \(r_i=\sqrt{a_i b_i}\) is the
+inner equal-area radius, and \(w\) is `hole_asymmetry_weight` (default 2). Because
+\(d/r_i\) is dimensionless, the penalty is a fractional surcharge that needs no
+retuning when exposure or normalization changes. Centroid weights are clipped at
+zero, so an over-subtracted background cannot send the centroid to infinity; an
+empty hole scores \(d=0\). Set \(w=0\) to score the hole sum alone.
+
+A low sum can still conceal a localized bright spot, but a spot that is off center
+now raises M2 in proportion to its displacement and brightness. Two images whose
+sums are within measurement noise are separated by this term.
 
 ### Run alignment
 

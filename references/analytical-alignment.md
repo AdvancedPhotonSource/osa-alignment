@@ -45,6 +45,14 @@ This precedes Canny's own `sigma` smoothing (default 2 pixels). All geometry
 initialization and edge fitting use the pre-blurred image; hole and annulus
 intensities are measured on the original image using the resulting fitted masks.
 
+Set `--hole-asymmetry-weight` (or `evaluator.hole_asymmetry_weight` in the
+alignment config) to weight the hole's intensity-centroid offset in M2. It is a
+nonnegative multiplier on the offset expressed in inner equal-area radii; the
+default is 2 and 0 disables the term. A pure hole sum cannot separate a uniformly
+dim hole from one whose light is piled up on one side, and it is inflated by halo
+bleeding inward from the annulus. The offset term separates them, which matters
+most when two positions' hole sums differ by less than the measurement noise.
+
 The script detects Canny edges, distinguishes inward and outward intensity
 transitions, and fits the concentric ellipses. Lower scores are better:
 
@@ -54,9 +62,18 @@ transitions, and fits the concentric ellipses. Lower scores are better:
   samples per boundary and a default coverage weight λ = 0.5. This measures
   geometry and completeness.
 - `secondary_metric` (M2): background-subtracted intensity summed inside the inner
-  boundary, optionally divided by `--intensity-normalizer`. Use `--background`
+  boundary, optionally divided by `--intensity-normalizer`, then scaled by
+  `1 + hole_asymmetry_weight * hole_centroid_offset_fraction` to penalize hole
+  intensity that sits off center. Use `--background`
   for a known scalar detector background. The input intensity scale is preserved;
   RGB images use luminance weights. Display-scaled images do not give photon counts.
+  `hole_centroid_offset_px` and `hole_centroid_offset_fraction` report the
+  intensity-weighted centroid's distance from the inner center, in pixels and in
+  inner equal-area radii; both are recorded even when the fit is invalid.
+  Centroid weights are clipped at zero so an over-subtracted background cannot
+  diverge the centroid, and an empty hole reports a zero offset rather than an
+  undefined one. Use `--hole-asymmetry-weight 0` (default 2) to score the hole
+  sum alone, reproducing the metric as it behaved before this term existed.
 
 M1 is always finite for an accepted image input, including failed optimizer
 convergence or fit validation. It uses residuals and unsupported angular coverage
@@ -125,7 +142,7 @@ motor units and limits that must be replaced with appropriate local values:
 | `bo_candidates` | null | Legacy field accepted when loading older configs; candidate counts are determined by the grid spacings |
 | `ei_xi` | 0 | EI improvement margin in the current objective's units (M1 or M2) |
 | `stage_2_min_ei` | 0 | Stop if maximum EI is at most this value, in M2 units |
-| `stage_2_target_m2` | null | Optional absolute M2 target under consistent acquisition conditions |
+| `stage_2_target_m2` | null | Optional absolute M2 target under consistent acquisition conditions; M2 includes the hole-asymmetry surcharge, so a target carried over from a hole-sum-only run reads low |
 | `seed` | 0 | Random seed for reproducible initialization selections |
 
 Set bounds and `max_step` for the current instrument. All settings are recorded at

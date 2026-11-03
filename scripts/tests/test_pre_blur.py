@@ -43,7 +43,8 @@ def test_blur_precedes_normalization_edges_and_seeds(monkeypatch, sigma):
 def test_photometry_uses_original_image_with_blurred_geometry(fixed):
     image = np.random.default_rng(7).poisson(10 * ring_image()).astype(float) / 10 + 2
     axes = dict(inner_axes=(12, 12), outer_axes=(30, 30)) if fixed else {}
-    config = Config(**axes, pre_blur_sigma=1, background=2, intensity_normalizer=5)
+    config = Config(**axes, pre_blur_sigma=1, background=2, intensity_normalizer=5,
+                    hole_asymmetry_weight=0)
     result = module.evaluate(image, config)
     assert result['valid'], result['reasons']
     fit = result['fit']

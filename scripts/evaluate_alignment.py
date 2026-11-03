@@ -36,6 +36,7 @@ class Config:
     background: float = 0.0
     intensity_normalizer: float = 1.0
     pre_blur_sigma: float = 0.0
+    hole_asymmetry_weight: float = 2.0
 
     def validate(self):
         if self.min_eccentricity is not None:
@@ -71,6 +72,8 @@ class Config:
             raise ValueError("background must be finite")
         if not np.isfinite(self.intensity_normalizer) or self.intensity_normalizer <= 0:
             raise ValueError("intensity_normalizer must be positive and finite")
+        if not np.isfinite(self.hole_asymmetry_weight) or self.hole_asymmetry_weight < 0:
+            raise ValueError("hole_asymmetry_weight must be nonnegative and finite")
 
 
 def grayscale(array: np.ndarray) -> np.ndarray:
@@ -148,7 +151,9 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
 
     M1 = mean boundary RMS distance / outer equal-area radius + coverage_weight *
          mean unsupported angular fraction. M2 = background-subtracted hole sum
-         / intensity_normalizer. Ellipses share a center and orientation. Coverage uses 360 true polar angles, one degree apart.
+         / intensity_normalizer, scaled by (1 + hole_asymmetry_weight * offset),
+         where offset is the hole's intensity centroid distance from the inner
+         center in units of its equal-area radius. Ellipses share a center and orientation. Coverage uses 360 true polar angles, one degree apart.
     Failed fits retain the best candidate geometry for M1; M2 is infinite when invalid.
     """
     config = config or Config()
@@ -338,14 +343,24 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
     corrected = image - config.background
     integral = float(corrected[hole].sum())
     ring_sum = float(corrected[annulus].sum())
+    # Clip to nonnegative weights: raw (I - background) sums crossing zero send the
+    # weighted centroid to infinity and then flip its sign.
+    weights = np.clip(corrected[hole], 0, None)
+    total = float(weights.sum())
+    # Rotation-invariant in the ellipse frame, so this equals the image-frame distance.
+    offset = 0. if total <= 0 else float(np.hypot((weights * u[hole]).sum() / total,
+                                                  (weights * v[hole]).sum() / total))
+    asymmetry = offset / fit["inner_equivalent_radius"]
     result.update(hole_integral=integral, hole_area_px=int(hole.sum()),
                   hole_mean=float(corrected[hole].mean()), annulus_integral=ring_sum,
-                  hole_to_annulus_ratio=integral / ring_sum if ring_sum > 0 else None)
+                  hole_to_annulus_ratio=integral / ring_sum if ring_sum > 0 else None,
+                  hole_centroid_offset_px=offset, hole_centroid_offset_fraction=asymmetry)
     if ring_sum <= 0 or corrected[annulus].mean() <= corrected[hole].mean():
         result["valid"] = False
         result["reasons"].append("Annulus is not brighter than the hole above background")
     if result["valid"]:
-        result["secondary_metric"] = integral / config.intensity_normalizer
+        result["secondary_metric"] = (integral / config.intensity_normalizer
+                                      * (1 + config.hole_asymmetry_weight * asymmetry))
     return result
 
 
@@ -378,6 +393,8 @@ def main():
     parser.add_argument("--max-gap-degrees", type=float, default=90.0)
     parser.add_argument("--background", type=float, default=0.0, help="Scalar detector background in input intensity units")
     parser.add_argument("--intensity-normalizer", type=float, default=1.0, help="Positive exposure/incident-flux normalization divisor")
+    parser.add_argument("--hole-asymmetry-weight", type=float, default=2.0,
+                        help="Weight on the hole intensity centroid offset, in inner equal-area radii; 0 scores the hole sum alone")
     args = parser.parse_args()
     config = Config(**{key: getattr(args, key) for key in Config.__dataclass_fields__})
     try:
