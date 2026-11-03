@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
 from pathlib import Path
+import re
 from threading import Thread
 
 import numpy as np
@@ -28,6 +29,15 @@ class Dashboard:
                 elif self.path == "/api/status":
                     body = json.dumps(dashboard.state(), allow_nan=False).encode()
                     content_type = "application/json"
+                elif match := re.fullmatch(r"/api/images/([1-9][0-9]*)", self.path):
+                    acquisition = int(match[1])
+                    observation = next((o for o in dashboard.state(include_image=False)["observations"]
+                                        if o.get("acquisition") == acquisition), None)
+                    if observation is None:
+                        self.send_error(404)
+                        return
+                    body = json.dumps(dashboard.preview(observation), allow_nan=False).encode()
+                    content_type = "application/json"
                 else:
                     self.send_error(404)
                     return
@@ -46,7 +56,7 @@ class Dashboard:
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
         self.url = f"http://127.0.0.1:{self.server.server_port}/"
 
-    def state(self):
+    def state(self, include_image=True):
         state = {"settings": {}, "observations": [], "result": None,
                  "message": "Waiting for the first acquisition", "updated": None,
                  "image": None, "image_note": "Waiting for an image"}
@@ -66,38 +76,49 @@ class Dashboard:
                     state["result"] = event["result"]
                 if "text" in event:
                     state["message"] = event["text"]
-        if state["observations"]:
-            try:
-                pixels = read_image(state["observations"][-1]["image"])
-                low, high = float(pixels.min()), float(pixels.max())
-                scaled = (pixels - low) / (high - low) if high > low else np.zeros_like(pixels)
-                preview = Image.fromarray(np.uint8(np.clip(scaled * 255, 0, 255))).convert("RGB")
-                preview.thumbnail((1000, 1000))
-                metrics = state["observations"][-1]["metrics"]
-                fit = metrics.get("fit")
-                overlay_note = "No fitted ellipse available"
-                if fit and all(key in fit for key in (
-                    "center_x", "center_y", "angle_degrees", "inner_axes", "outer_axes"
-                )):
-                    draw = ImageDraw.Draw(preview)
-                    angles = np.linspace(0, 2 * np.pi, 721)
-                    sx, sy = preview.width / pixels.shape[1], preview.height / pixels.shape[0]
-                    for boundary, color in (("inner", "#00ffff"), ("outer", "#ff9900")):
-                        x, y = boundary_points(fit, boundary, angles)
-                        points = list(zip((x + .5) * sx - .5, (y + .5) * sy - .5))
-                        draw.line(points, fill=color, width=2)
-                    overlay_note = ("Ellipse overlay: inner cyan, outer orange; "
-                                    + ("valid fit" if metrics.get("valid") else "fit failed validation"))
-                buffer = BytesIO()
-                preview.save(buffer, format="PNG")
-                state["image"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-                state["image_note"] = (f"Display intensity range: {low:.5g}–{high:.5g} (linear). "
-                                       + overlay_note)
-            except (OSError, ValueError) as exc:
-                state["image_note"] = f"Image preview unavailable: {exc}"
+        if include_image and state["observations"]:
+            state.update(self.preview(state["observations"][-1]))
         return state
 
+    @staticmethod
+    def preview(observation):
+        """Load a recorded image and overlay its fit in detector pixel coordinates."""
+        preview_data = {"image": None, "image_note": ""}
+        try:
+            pixels = read_image(observation["image"])
+            low, high = float(pixels.min()), float(pixels.max())
+            scaled = (pixels - low) / (high - low) if high > low else np.zeros_like(pixels)
+            preview = Image.fromarray(np.uint8(np.clip(scaled * 255, 0, 255))).convert("RGB")
+            preview.thumbnail((1000, 1000))
+            metrics = observation["metrics"]
+            fit = metrics.get("fit")
+            overlay_note = "No fitted ellipse available"
+            if fit and all(key in fit for key in (
+                "center_x", "center_y", "angle_degrees", "inner_axes", "outer_axes"
+            )):
+                draw = ImageDraw.Draw(preview)
+                angles = np.linspace(0, 2 * np.pi, 721)
+                sx, sy = preview.width / pixels.shape[1], preview.height / pixels.shape[0]
+                for boundary, color in (("inner", "#00ffff"), ("outer", "#ff9900")):
+                    x, y = boundary_points(fit, boundary, angles)
+                    points = list(zip((x + .5) * sx - .5, (y + .5) * sy - .5))
+                    draw.line(points, fill=color, width=2)
+                overlay_note = ("Ellipse overlay: inner cyan, outer orange; "
+                                + ("valid fit" if metrics.get("valid") else "fit failed validation"))
+            buffer = BytesIO()
+            preview.save(buffer, format="PNG")
+            preview_data["image"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+            preview_data["image_note"] = (f"Display intensity range: {low:.5g}–{high:.5g} (linear). "
+                                          + overlay_note)
+        except (OSError, ValueError) as exc:
+            preview_data["image_note"] = f"Image preview unavailable: {exc}"
+        return preview_data
+
     def html(self, state=None):
+        if state is not None:
+            # Embed previews so saved snapshots can browse TIFF acquisitions offline.
+            state = dict(state, observations=[dict(o, preview=self.preview(o))
+                                               for o in state["observations"]])
         # Escape '<' so image paths and log text cannot terminate the script element.
         payload = json.dumps(state, allow_nan=False).replace("<", "\\u003c")
         return self.template.replace("/* INITIAL_STATE */ null", payload)

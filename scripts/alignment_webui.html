@@ -19,7 +19,13 @@ p { line-height: 1.5; } .muted, figcaption { color: #526675; font-size: 13px; }
 .value { font-size: 23px; font-weight: 600; margin-top: 6px; overflow-wrap: anywhere; }
 svg { width: 100%; display: block; } svg text { font: 11px system-ui, sans-serif; fill: #526675; }
 figure { margin: 0; } #image { display: block; max-width: 100%; max-height: 480px; margin: auto; }
+#image[hidden] { display: none; }
 figcaption { margin-top: 12px; overflow-wrap: anywhere; }
+.image-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+button { cursor: pointer; } button:disabled { cursor: default; }
+#history tr { cursor: pointer; } #history tr:hover { background: #f0f7fa; }
+#history tr.selected { background: #dcece7; }
+#history button { color: #185a48; background: none; border: 0; text-decoration: underline; font: inherit; }
 pre { font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 #message { margin-bottom: 0; overflow-wrap: anywhere; } .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
@@ -42,13 +48,14 @@ th, td { padding: 8px; text-align: left; border-bottom: 1px solid #e8eef2; white
 <section class="card"><h2>M2 · Hole intensity and centroid offset</h2><svg id="secondary" viewBox="0 0 460 330" role="img" aria-label="M2 history"></svg><p class="muted">All finite observations, including rejected trials and confirmations.</p></section>
 </div>
 <div class="details">
-<section class="card"><h2>Latest acquired image</h2><figure><img id="image" alt="Latest OSA detector image" hidden><figcaption id="image-note">Waiting for an image</figcaption></figure></section>
+<section class="card"><div class="image-heading"><h2 id="image-title">Latest acquired image</h2><button id="go-live" type="button" disabled>Go to live</button></div><figure><img id="image" alt="OSA detector image" hidden><figcaption><div id="image-filename"></div><div id="image-note">Waiting for an image</div></figcaption></figure></section>
 <section class="card"><h2>Run settings</h2><p id="mode" class="muted"></p><pre id="settings"></pre></section>
 </div>
 <section class="card" style="margin-top:16px"><h2>Current activity</h2><div id="updated" class="muted"></div><p id="message"></p><p id="final" class="muted"></p></section>
-<section class="card" style="margin-top:16px"><h2>Observation history</h2><p class="muted">Ellipse centers and semiaxes are in detector pixels. Angle is clockwise from image +x toward +y. Failed fits retain their candidate parameters when available.</p><div class="scroll"><table><thead><tr><th>#</th><th>Stage</th><th>Motor x</th><th>Motor y</th><th>M1</th><th>M2</th><th>Fit</th><th>Center (x, y), px</th><th>Inner (a, b), px</th><th>Outer (a, b), px</th><th>Angle (°)</th><th>Axes</th><th>BO eligibility</th></tr></thead><tbody id="history"></tbody></table></div></section>
+<section class="card" style="margin-top:16px"><h2>Observation history</h2><p class="muted">Click a step to view its image. Ellipse centers and semiaxes are in detector pixels. Angle is clockwise from image +x toward +y. Failed fits retain their candidate parameters when available.</p><div class="scroll"><table><thead><tr><th>#</th><th>Stage</th><th>Motor x</th><th>Motor y</th><th>M1</th><th>M2</th><th>Fit</th><th>Center (x, y), px</th><th>Inner (a, b), px</th><th>Outer (a, b), px</th><th>Angle (°)</th><th>Axes</th><th>BO eligibility</th></tr></thead><tbody id="history"></tbody></table></div></section>
 <script>
 const initialState = /* INITIAL_STATE */ null;
+let currentState = null, selectedAcquisition = null, selectedPreview = null, imageRequest = 0;
 const byId = id => document.getElementById(id);
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const format = value => finite(value) ? Number(value.toPrecision(5)).toString() : (value ?? '—');
@@ -123,7 +130,51 @@ function plot(id, rows, metric, settings) {
     for (const {p, ids} of labels.values()) svg.append(node('text', {x: x(p.x) + 7, y: y(p.y) - 9}, ids.join(', ')));
   }
 }
+function renderImage() {
+  const state = currentState;
+  const observation = selectedAcquisition === null ? state.observations.at(-1)
+    : state.observations.find(o => o.acquisition === selectedAcquisition);
+  const preview = selectedAcquisition === null ? state : selectedPreview;
+  byId('image-title').textContent = selectedAcquisition === null ? 'Latest acquired image' : `Image from step #${selectedAcquisition}`;
+  byId('go-live').disabled = selectedAcquisition === null;
+  byId('image').hidden = !preview?.image;
+  if (preview?.image) {
+    if (byId('image').getAttribute('src') !== preview.image) byId('image').src = preview.image;
+  } else byId('image').removeAttribute('src');
+  byId('image-filename').textContent = observation?.image?.split(/[\\/]/).at(-1) ?? '';
+  byId('image-note').textContent = `${observation ? `#${observation.acquisition} · ${observation.stage} · (${observation.position.map(format).join(', ')}) ${state.settings.units} · ` : ''}${preview?.image_note ?? 'Loading image…'}`;
+  for (const row of byId('history').children) {
+    const selected = Number(row.dataset.acquisition) === selectedAcquisition;
+    row.classList.toggle('selected', selected);
+    row.querySelector('button').setAttribute('aria-pressed', String(selected));
+  }
+}
+async function selectImage(observation) {
+  const request = ++imageRequest;
+  selectedAcquisition = observation.acquisition;
+  selectedPreview = observation.preview ?? null;
+  renderImage();
+  if (selectedPreview) return;
+  try {
+    const response = await fetch(`/api/images/${observation.acquisition}`, {cache: 'no-store'});
+    if (!response.ok) throw new Error('Image preview unavailable');
+    const preview = await response.json();
+    if (request !== imageRequest) return;
+    selectedPreview = preview;
+  } catch {
+    if (request !== imageRequest) return;
+    selectedPreview = {image: null, image_note: 'Image preview unavailable. Select the step to retry.'};
+  }
+  renderImage();
+}
+byId('go-live').addEventListener('click', () => {
+  ++imageRequest;
+  selectedAcquisition = null;
+  selectedPreview = null;
+  renderImage();
+});
 function render(state) {
+  currentState = state;
   const rows = state.observations, latest = rows.at(-1), settings = state.settings;
   byId('status').textContent = state.result?.status ?? (latest?.stage ?? 'Starting');
   byId('count').textContent = `${state.result?.acquisitions ?? rows.length} / ${settings.max_acquisitions ?? '—'}`;
@@ -134,14 +185,13 @@ function render(state) {
   byId('message').textContent = state.message;
   byId('updated').textContent = state.updated ? `Last event: ${new Date(state.updated).toLocaleString()}` : '';
   byId('final').textContent = state.result ? `Final readback: ${JSON.stringify(state.result.final_readback)} · ${state.result.reason}` : '';
-  byId('image').hidden = !state.image;
-  if (state.image && byId('image').getAttribute('src') !== state.image) byId('image').src = state.image;
-  byId('image-note').textContent = `${latest ? `#${latest.acquisition} · ${latest.stage} · (${latest.position.map(format).join(', ')}) ${settings.units} · ` : ''}${state.image_note}`;
   plot('trajectory', rows, null, settings);
   plot('primary', rows, 'primary_metric', settings);
   plot('secondary', rows, 'secondary_metric', settings);
   byId('history').replaceChildren(...rows.slice().reverse().map(o => {
     const tr = document.createElement('tr');
+    tr.dataset.acquisition = o.acquisition;
+    tr.addEventListener('click', () => selectImage(o));
     const fit = o.metrics.fit;
     const fitStatus = fit ? (o.metrics.valid ? 'Valid' : 'Failed validation') : 'No fit';
     const axesMode = typeof fit?.axes_fixed === 'boolean' ? (fit.axes_fixed ? 'Fixed' : 'Fitted') : '—';
@@ -150,8 +200,13 @@ function render(state) {
       format(fit?.angle_degrees), axesMode, o.bo_eligible ? 'Eligible' : o.bo_rejection_reason]) {
       const td = document.createElement('td'); td.textContent = value; tr.append(td);
     }
+    const button = document.createElement('button');
+    button.type = 'button'; button.textContent = o.acquisition;
+    button.setAttribute('aria-label', `Show image from step ${o.acquisition}`);
+    tr.firstElementChild.replaceChildren(button);
     return tr;
   }));
+  renderImage();
 }
 async function poll() {
   try {

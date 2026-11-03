@@ -164,3 +164,41 @@ def test_preview_without_fitted_geometry(tmp_path):
         assert "No fitted ellipse available" in state["image_note"]
     finally:
         dashboard.close()
+
+
+def test_historical_images_and_offline_snapshot(tmp_path):
+    log = tmp_path / "run.jsonl"
+    events = []
+    for acquisition in (1, 2, 3):
+        image = tmp_path / f"detector-{acquisition}.tif"
+        if acquisition != 2:
+            pixels = np.arange(400, dtype=np.uint16).reshape(20, 20)
+            Image.fromarray(pixels if acquisition == 1 else pixels.T).save(image)
+        events.append(dict(event="observation", time="2026-11-03T00:00:00Z",
+                           observation=dict(acquisition=acquisition, image=str(image),
+                                            metrics=dict(fit=None, valid=False))))
+    log.write_text("".join(json.dumps(event) + "\n" for event in events))
+    dashboard = Dashboard(log, port=0)
+    dashboard.start()
+    try:
+        latest = json.load(request(dashboard))
+        first = json.load(request(dashboard, "api/images/1"))
+        assert first == dashboard.preview(events[0]["observation"])
+        assert first["image"] != latest["image"]
+        assert json.load(request(dashboard, "api/images/3"))["image"] == latest["image"]
+        missing = json.load(request(dashboard, "api/images/2"))
+        assert missing["image"] is None
+        assert "Image preview unavailable" in missing["image_note"]
+        for path in ("api/images/0", "api/images/4", "api/images/../etc/passwd",
+                     "api/images/1?image=/etc/passwd"):
+            with pytest.raises(HTTPError) as error:
+                request(dashboard, path)
+            assert error.value.code == 404
+        assert json.load(request(dashboard))["image"] == latest["image"]
+    finally:
+        dashboard.close()
+    html = dashboard.snapshot_path.read_text()
+    saved = json.loads(html.split("const initialState = ", 1)[1].split(";\n", 1)[0])
+    assert [o["preview"] for o in saved["observations"]] == [first, missing, {
+        "image": latest["image"], "image_note": latest["image_note"]}]
+    assert [o["image"] for o in saved["observations"]] == [e["observation"]["image"] for e in events]
