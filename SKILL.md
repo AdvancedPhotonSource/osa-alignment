@@ -9,7 +9,7 @@ An order sorting aperture blocks unwanted diffraction orders from the focusing
 optics while passing the intended focused order. Alignment of the OSA relative
 to the optics should produce a symmetric, complete donut with a clean, dark hole.
 The two quantitative objectives are well-defined concentric boundaries and low
-integrated intensity inside the hole.
+central hole intensity relative to the annulus.
 
 **Use the analytical scripts by default.** They handle image evaluation and the
 two-stage Bayesian motor search. Detailed input formats, configuration parameters,
@@ -70,8 +70,8 @@ uv sync --project scripts --locked
 ### Evaluate an image
 
 [scripts/evaluate_alignment.py](scripts/evaluate_alignment.py) fits concentric
-ellipses and returns M1 (boundary error and completeness) and M2 (integrated hole
-intensity). Lower values are better. M1 stays finite on failed fits using the best available
+ellipses and returns M1 (boundary error and completeness) and M2 (centrally weighted
+hole-to-annulus mean intensity ratio). Lower values are better. M1 stays finite on failed fits using the best available
 optimizer geometry; M2 remains infinite when the fit is invalid.
 
 ```sh
@@ -93,7 +93,7 @@ then be supplied as fixed semiaxes for evaluating subsequent alignment images.
 Use `--pre-blur-sigma 1` (or `evaluator.pre_blur_sigma: 1`) to apply a 1-pixel
 Gaussian blur before intensity normalization, edge detection, and ellipse fitting.
 The default is 0, which disables pre-blurring. Canny retains its own `sigma`
-smoothing (default 2 pixels). M2 integrates the original image inside the fitted hole.
+smoothing (default 2 pixels). M2 measures the original image intensities.
 **Supply the best guess of the semiaxes whenever possible as they are important for accurate fitting**.
 
 #### Definitions and interpretation of the M1 and M2 metrics
@@ -116,32 +116,40 @@ boundary RMS distance is 2% of the outer equal-area radius. With incomplete
 coverage, the score also includes the missing-arc penalty. M1 does not directly
 measure angular brightness balance or contamination inside the hole.
 
-**M2 (`secondary_metric`) measures integrated signal inside the fitted hole and
-how far off center that signal sits.**
+**M2 (`secondary_metric`) measures centrally weighted hole brightness relative
+to the annulus, with an optional intensity-centroid penalty.**
 
 \[
-M_2 = \frac{1}{S}\left(\sum_{p\,\mathrm{inside\ inner\ ellipse}} (I_p-B)\right)
-      \left(1 + w\,\frac{d}{r_i}\right),
+M_2 = \frac{1}{S}
+      \frac{\sum_{p\in H} g_p(I_p-B)/\sum_{p\in H}g_p}
+           {\sum_{p\in A}(I_p-B)/|A|}
+      \left(1 + \lambda\,\frac{d}{r_i}\right),
+\qquad
+g_p = \exp\left[-\frac{\rho_p^2}{2(0.25)^2}\right],
+\qquad
+\rho_p^2 = (u_p/a_i)^2 + (v_p/b_i)^2.
 \]
 
-where \(B\) is the configured scalar background and \(S\) is the intensity
-normalizer (defaults: 0 and 1). The first factor is a pixel sum, not mean intensity
-or a hole-to-ring ratio. Lower M2 means less residual central signal under comparable
-conditions. Its scale depends on image intensity units, exposure, normalization,
-and hole area; it has no universal acceptable cutoff. Fixed semiaxes and consistent
-acquisition settings make comparisons meaningful.
+Here \(H\) is the fitted hole (\(\rho_p<1\)), \(A\) is the annulus between the
+fitted boundaries, and \((u_p,v_p)\) are coordinates relative to the fitted center,
+rotated into the ellipse frame. The Gaussian width is fixed at one quarter of
+each inner semiaxis. Central weighting and annulus normalization are always active.
+\(B\) is the configured scalar background and \(S\) is `intensity_normalizer`,
+an additional score divisor (defaults: 0 and 1). The ratio is dimensionless and
+cancels uniform multiplicative intensity changes when background is scaled
+consistently and pixels are unclipped. Lower M2 means less central leakage;
+strict monotonicity with motor-position error is not guaranteed.
 
-The second factor penalizes asymmetry. \(d\) is the distance from the inner ellipse
+The final factor penalizes asymmetry. \(d\) is the distance from the inner ellipse
 center to the intensity-weighted centroid of the hole, \(r_i=\sqrt{a_i b_i}\) is the
-inner equal-area radius, and \(w\) is `hole_asymmetry_weight` (default 2). Because
-\(d/r_i\) is dimensionless, the penalty is a fractional surcharge that needs no
-retuning when exposure or normalization changes. Centroid weights are clipped at
-zero, so an over-subtracted background cannot send the centroid to infinity; an
-empty hole scores \(d=0\). Set \(w=0\) to score the hole sum alone.
+inner equal-area radius, and \(\lambda\) is `hole_asymmetry_weight` (default 0,
+disabling the penalty). The centroid uses the full hole with weights
+\(\max(I_p-B,0)\); an empty hole has zero offset.
 
-A low sum can still conceal a localized bright spot, but a spot that is off center
-now raises M2 in proportion to its displacement and brightness. Two images whose
-sums are within measurement noise are separated by this term.
+`hole_weighted_mean` and `annulus_mean` report the numerator and denominator.
+`hole_integral`, `hole_mean`, and `hole_to_annulus_ratio` retain their full-region
+diagnostic definitions. Calibrate absolute M2 stopping thresholds for this
+dimensionless score; thresholds from the integrated-intensity metric do not apply.
 
 ### Run alignment
 

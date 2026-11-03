@@ -36,7 +36,7 @@ class Config:
     background: float = 0.0
     intensity_normalizer: float = 1.0
     pre_blur_sigma: float = 0.0
-    hole_asymmetry_weight: float = 2.0
+    hole_asymmetry_weight: float = 0.0
 
     def validate(self):
         if self.min_eccentricity is not None:
@@ -150,10 +150,16 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
     """Return scores plus fit diagnostics. M1 stays finite even when fit validation fails.
 
     M1 = mean boundary RMS distance / outer equal-area radius + coverage_weight *
-         mean unsupported angular fraction. M2 = background-subtracted hole sum
-         / intensity_normalizer, scaled by (1 + hole_asymmetry_weight * offset),
-         where offset is the hole's intensity centroid distance from the inner
-         center in units of its equal-area radius. Ellipses share a center and orientation. Coverage uses 360 true polar angles, one degree apart.
+         mean unsupported angular fraction.
+    M2 = Gaussian-weighted hole mean / annulus mean / intensity_normalizer,
+         scaled by (1 + hole_asymmetry_weight * offset). Both means subtract
+         background from the original image. Gaussian weights are exp(-rho² /
+         (2 * 0.25²)), with rho² = (u/inner_a)² + (v/inner_b)² in the fitted
+         ellipse frame, truncated at rho < 1. Offset is the full hole's intensity
+         centroid distance from the fitted center in inner equal-area radii;
+         its multiplier defaults to zero. M2 is dimensionless.
+    Ellipses share a center and orientation. Coverage uses 360 true polar angles,
+    one degree apart.
     Failed fits retain the best candidate geometry for M1; M2 is infinite when invalid.
     """
     config = config or Config()
@@ -333,7 +339,8 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
     u, v = np.cos(theta) * dx + np.sin(theta) * dy, -np.sin(theta) * dx + np.cos(theta) * dy
     ia, ib = fit["inner_axes"]
     oa, ob = fit["outer_axes"]
-    hole = (u / ia)**2 + (v / ib)**2 < 1
+    rho2 = (u / ia)**2 + (v / ib)**2
+    hole = rho2 < 1
     inside_outer = (u / oa)**2 + (v / ob)**2 <= 1
     annulus = inside_outer & ~hole
     if not hole.any() or not annulus.any():
@@ -343,6 +350,10 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
     corrected = image - config.background
     integral = float(corrected[hole].sum())
     ring_sum = float(corrected[annulus].sum())
+    ring_mean = float(corrected[annulus].mean())
+    # A quarter-semiaxis Gaussian suppresses the bright rim around the hole.
+    central_weights = np.exp(-rho2[hole] / (2 * 0.25**2))
+    weighted_mean = float(np.sum(central_weights * corrected[hole]) / central_weights.sum())
     # Clip to nonnegative weights: raw (I - background) sums crossing zero send the
     # weighted centroid to infinity and then flip its sign.
     weights = np.clip(corrected[hole], 0, None)
@@ -353,13 +364,14 @@ def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
     asymmetry = offset / fit["inner_equivalent_radius"]
     result.update(hole_integral=integral, hole_area_px=int(hole.sum()),
                   hole_mean=float(corrected[hole].mean()), annulus_integral=ring_sum,
+                  hole_weighted_mean=weighted_mean, annulus_mean=ring_mean,
                   hole_to_annulus_ratio=integral / ring_sum if ring_sum > 0 else None,
                   hole_centroid_offset_px=offset, hole_centroid_offset_fraction=asymmetry)
-    if ring_sum <= 0 or corrected[annulus].mean() <= corrected[hole].mean():
+    if ring_sum <= 0 or ring_mean <= corrected[hole].mean():
         result["valid"] = False
         result["reasons"].append("Annulus is not brighter than the hole above background")
     if result["valid"]:
-        result["secondary_metric"] = (integral / config.intensity_normalizer
+        result["secondary_metric"] = (weighted_mean / ring_mean / config.intensity_normalizer
                                       * (1 + config.hole_asymmetry_weight * asymmetry))
     return result
 
@@ -392,9 +404,9 @@ def main():
     parser.add_argument("--min-coverage", type=float, default=0.65)
     parser.add_argument("--max-gap-degrees", type=float, default=90.0)
     parser.add_argument("--background", type=float, default=0.0, help="Scalar detector background in input intensity units")
-    parser.add_argument("--intensity-normalizer", type=float, default=1.0, help="Positive exposure/incident-flux normalization divisor")
-    parser.add_argument("--hole-asymmetry-weight", type=float, default=2.0,
-                        help="Weight on the hole intensity centroid offset, in inner equal-area radii; 0 scores the hole sum alone")
+    parser.add_argument("--intensity-normalizer", type=float, default=1.0, help="Positive additional divisor for the dimensionless M2 score")
+    parser.add_argument("--hole-asymmetry-weight", type=float, default=0.0,
+                        help="Weight on the hole intensity centroid offset, in inner equal-area radii; default 0 disables the symmetry penalty")
     args = parser.parse_args()
     config = Config(**{key: getattr(args, key) for key in Config.__dataclass_fields__})
     try:

@@ -12,7 +12,7 @@ uv sync --project scripts --locked
 ## Quantitative evaluation
 
 Use [scripts/evaluate_alignment.py](../scripts/evaluate_alignment.py) to measure
-concentric boundary geometry and integrated hole intensity. Dependencies are
+concentric boundary geometry and central hole-to-annulus intensity contrast. Dependencies are
 managed by the local `uv` project in `scripts/`. From the skill directory:
 
 ```sh
@@ -48,10 +48,10 @@ intensities are measured on the original image using the resulting fitted masks.
 Set `--hole-asymmetry-weight` (or `evaluator.hole_asymmetry_weight` in the
 alignment config) to weight the hole's intensity-centroid offset in M2. It is a
 nonnegative multiplier on the offset expressed in inner equal-area radii; the
-default is 2 and 0 disables the term. A pure hole sum cannot separate a uniformly
-dim hole from one whose light is piled up on one side, and it is inflated by halo
-bleeding inward from the annulus. The offset term separates them, which matters
-most when two positions' hole sums differ by less than the measurement noise.
+default is 0, disabling the term. Gaussian central weighting and annulus
+normalization are always active, with a fixed Gaussian width of 0.25 times each
+inner semiaxis. This emphasizes central leakage while reducing the bright rim's
+contribution.
 
 The script detects Canny edges, distinguishes inward and outward intensity
 transitions, and fits the concentric ellipses. Lower scores are better:
@@ -61,19 +61,23 @@ transitions, and fits the concentric ellipses. Lower scores are better:
   angular coverage. Both boundaries receive equal weight, with 360 true polar-angle
   samples per boundary and a default coverage weight λ = 0.5. This measures
   geometry and completeness.
-- `secondary_metric` (M2): background-subtracted intensity summed inside the inner
-  boundary, optionally divided by `--intensity-normalizer`, then scaled by
-  `1 + hole_asymmetry_weight * hole_centroid_offset_fraction` to penalize hole
-  intensity that sits off center. Use `--background`
-  for a known scalar detector background. The input intensity scale is preserved;
-  RGB images use luminance weights. Display-scaled images do not give photon counts.
+- `secondary_metric` (M2): Gaussian-weighted hole mean divided by the annulus mean,
+  using original background-subtracted intensities. In fitted ellipse coordinates,
+  the hole weights are `exp(-rho_squared / (2 * 0.25**2))`, where
+  `rho_squared = (u / inner_a)**2 + (v / inner_b)**2 < 1`. The ratio is divided by
+  `--intensity-normalizer` (default 1), then multiplied by
+  `1 + hole_asymmetry_weight * hole_centroid_offset_fraction` (default weight 0).
+  Use `--background` for a known scalar detector background. M2 is dimensionless;
+  uniform multiplicative intensity changes cancel when background scales with
+  the signal and pixels are unclipped. RGB images use luminance weights.
+  `hole_weighted_mean` and `annulus_mean` expose the two means. The full-hole
+  integral, mean, and hole-to-annulus integral ratio remain available as diagnostics.
   `hole_centroid_offset_px` and `hole_centroid_offset_fraction` report the
   intensity-weighted centroid's distance from the inner center, in pixels and in
   inner equal-area radii; both are recorded even when the fit is invalid.
   Centroid weights are clipped at zero so an over-subtracted background cannot
   diverge the centroid, and an empty hole reports a zero offset rather than an
-  undefined one. Use `--hole-asymmetry-weight 0` (default 2) to score the hole
-  sum alone, reproducing the metric as it behaved before this term existed.
+  undefined one. The optional centroid penalty uses full-hole intensities.
 
 M1 is always finite for an accepted image input, including failed optimizer
 convergence or fit validation. It uses residuals and unsupported angular coverage
@@ -142,7 +146,7 @@ motor units and limits that must be replaced with appropriate local values:
 | `bo_candidates` | null | Legacy field accepted when loading older configs; candidate counts are determined by the grid spacings |
 | `ei_xi` | 0 | EI improvement margin in the current objective's units (M1 or M2) |
 | `stage_2_min_ei` | 0 | Stop if maximum EI is at most this value, in M2 units |
-| `stage_2_target_m2` | null | Optional absolute M2 target under consistent acquisition conditions; M2 includes the hole-asymmetry surcharge, so a target carried over from a hole-sum-only run reads low |
+| `stage_2_target_m2` | null | Optional absolute target for the dimensionless, centrally weighted hole-to-annulus ratio; recalibrate thresholds from integrated-intensity runs and account for any enabled centroid penalty |
 | `seed` | 0 | Random seed for reproducible initialization selections |
 
 Set bounds and `max_step` for the current instrument. All settings are recorded at
@@ -473,4 +477,4 @@ blind recovery. Exhausted search with confirmed feasible geometry gives
 `metric_target_reached` requires all final reimages to satisfy both the M1 bound
 and explicit `stage_2_target_m2`. Omitting the M2 target reports the best result without
 asserting optimality. This numerical result supports the skill's visual criteria;
-a low integrated hole signal alone cannot exclude every localized bright defect.
+a low central-leakage score alone cannot exclude every localized bright defect.

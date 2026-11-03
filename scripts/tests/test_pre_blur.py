@@ -54,10 +54,16 @@ def test_photometry_uses_original_image_with_blurred_geometry(fixed):
     u = np.cos(angle)*dx + np.sin(angle)*dy
     v = -np.sin(angle)*dx + np.cos(angle)*dy
     a,b = fit['inner_axes']
-    hole = (u/a)**2 + (v/b)**2 < 1
+    rho2 = (u/a)**2 + (v/b)**2
+    hole = rho2 < 1
+    oa, ob = fit['outer_axes']
+    annulus = ((u/oa)**2 + (v/ob)**2 <= 1) & ~hole
+    weights = np.exp(-rho2[hole] / (2 * .25**2))
+    weighted_mean = np.sum(weights * (image-2)[hole]) / weights.sum()
+    ring_mean = (image-2)[annulus].mean()
     expected = float((image-2)[hole].sum())
     assert result['hole_integral'] == expected
-    assert result['secondary_metric'] == expected / 5
+    assert result['secondary_metric'] == pytest.approx(weighted_mean / ring_mean / 5)
     assert abs(float((gaussian_filter(image, 1)-2)[hole].sum())-expected) > 1
 
 

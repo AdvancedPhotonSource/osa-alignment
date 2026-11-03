@@ -1,4 +1,4 @@
-"""M2 penalizes hole intensity that sits off the inner ellipse center."""
+"""M2 optionally penalizes hole intensity that sits off the inner ellipse center."""
 import json
 import sys
 
@@ -39,7 +39,7 @@ def hole_mask(result, shape):
 
 
 @pytest.mark.parametrize('fixed', [False, True])
-def test_zero_weight_reproduces_the_plain_hole_sum(fixed):
+def test_zero_weight_uses_the_central_leakage_ratio(fixed):
     image = filled_ring(30, offset=6)
     axes = AXES if fixed else {}
     result = module.evaluate(image, Config(**axes, intensity_normalizer=5,
@@ -47,7 +47,8 @@ def test_zero_weight_reproduces_the_plain_hole_sum(fixed):
     assert result['valid'], result['reasons']
     expected = float(image[hole_mask(result, image.shape)].sum())
     assert result['hole_integral'] == expected
-    assert result['secondary_metric'] == expected / 5
+    assert result['secondary_metric'] == pytest.approx(
+        result['hole_weighted_mean'] / result['annulus_mean'] / 5)
     assert result['hole_centroid_offset_px'] > 0
 
 
@@ -56,15 +57,16 @@ def test_centered_hole_intensity_is_not_penalized():
     result = module.evaluate(filled_ring(30), Config(**AXES, hole_asymmetry_weight=2))
     assert result['valid'], result['reasons']
     assert result['hole_centroid_offset_px'] < 0.25
-    assert result['secondary_metric'] == pytest.approx(result['hole_integral'], rel=0.05)
+    assert result['secondary_metric'] == pytest.approx(
+        result['hole_weighted_mean'] / result['annulus_mean'], rel=0.05)
 
 
-def test_offset_hole_intensity_raises_m2_above_its_integral():
+def test_optional_asymmetry_raises_m2_above_the_central_leakage_ratio():
     centered = module.evaluate(filled_ring(30), Config(**AXES))
-    offset = module.evaluate(filled_ring(200, offset=6), Config(**AXES))
+    offset = module.evaluate(filled_ring(200, offset=6), Config(**AXES, hole_asymmetry_weight=2))
     assert offset['valid'], offset['reasons']
     assert offset['hole_centroid_offset_px'] > 1
-    assert offset['secondary_metric'] > offset['hole_integral']
+    assert offset['secondary_metric'] > offset['hole_weighted_mean'] / offset['annulus_mean']
     assert offset['hole_centroid_offset_px'] > centered['hole_centroid_offset_px']
 
 
@@ -74,7 +76,7 @@ def test_offset_fraction_scales_the_penalty():
     fraction = result['hole_centroid_offset_fraction']
     assert fraction == pytest.approx(result['hole_centroid_offset_px'] / 12, rel=1e-9)
     assert result['secondary_metric'] == pytest.approx(
-        result['hole_integral'] * (1 + 2 * fraction), rel=1e-9)
+        result['hole_weighted_mean'] / result['annulus_mean'] * (1 + 2 * fraction), rel=1e-9)
 
 
 def test_dark_hole_keeps_a_finite_defined_score():
@@ -130,4 +132,4 @@ def test_cli_defaults_to_the_documented_weight(tmp_path, monkeypatch, capsys):
     Image.fromarray(ring_image().astype(np.float32)).save(image)
     monkeypatch.setattr(sys, 'argv', ['evaluate_alignment.py', str(image)])
     module.main()
-    assert json.loads(capsys.readouterr().out)['config']['hole_asymmetry_weight'] == 2.
+    assert json.loads(capsys.readouterr().out)['config']['hole_asymmetry_weight'] == 0.
