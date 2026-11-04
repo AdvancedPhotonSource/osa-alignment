@@ -140,6 +140,7 @@ motor units and limits that must be replaced with appropriate local values:
 | `gp_length_scale` | [2.5, 2.5] | Initial Matérn-5/2 length scales and fallback before three distinct eligible locations, in motor units |
 | `gp_length_scale_bounds` | [0.5, 10] | Positive finite lower/upper bounds shared by both fitted spatial scales, in motor units |
 | `gp_noise` | 0.05 | Observation standard deviation in standardized GP target units; squared for GP alpha |
+| `gp_position_source` | `"requested"` | Coordinates for M1/M2 GP training: `"requested"` uses commanded targets, assuming those are the acquisition locations; `"readback"` uses measured positions |
 | `stage_2_gp_stage_1_noise_multiplier` | 3 | Multiplier on M2 GP noise for baseline and Stage 1 observations; finite and at least 1; default gives nine times the variance |
 | `stage_1_grid_spacing` | 1.0 | Candidate grid spacing along both axes over the global bounds, in motor units (µm for `units: "um"`) |
 | `stage_2_grid_spacing` | 0.1 | Candidate grid spacing along both axes within the current clipped local box, in motor units |
@@ -254,6 +255,11 @@ distinct eligible locations, fit anisotropic length scales by maximizing margina
 likelihood within `gp_length_scale_bounds`; before then, use `gp_length_scale`
 as a configured fallback. Each iteration rebuilds the GP from eligible history
 and logs its scales, whether they were fitted, and training acquisition IDs.
+
+GPs train on each observation's requested target by default. Set
+`"gp_position_source": "readback"` to use measured coordinates for both GP objectives. Recorded `position`
+values, motion checks, candidate spacing and exclusions, and the Stage 1 quadratic
+fit continue to use readbacks. The run's start event records the coordinate setting.
 
 Invalid fits and nonfinite or above-threshold M1 create spatial exclusions.
 For each rejected position `q`, exclude candidates `p` satisfying

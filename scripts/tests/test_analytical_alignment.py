@@ -16,7 +16,7 @@ from evaluate_alignment import Config, evaluate
 def observation(position, *, invalid=False):
     p = np.asarray(position)
     g = .01 + .001 * np.sum(p ** 2)
-    return dict(image="synthetic", position=p.tolist(), metrics=dict(
+    return dict(image="synthetic", position=p.tolist(), target=p.tolist(), metrics=dict(
         valid=not invalid, reasons=["synthetic missing boundary"] if invalid else [],
         primary_metric=g,
         secondary_metric=float("inf") if invalid else 10. + np.sum(p ** 2),
@@ -63,6 +63,44 @@ def test_gp_uses_only_eligible_objectives():
     assert np.all(scores >= 0)
 
 
+@pytest.mark.parametrize('metric', ['primary_metric', 'secondary_metric'])
+def test_gp_requested_coordinates_resolve_repeated_readbacks(metric):
+    observations = [observation([0, y]) for y in [0, 1, 2]]
+    for obs in observations:
+        obs['target'] = obs['position'].copy()
+        obs['position'] = [0, 1]
+    readback, readback_fitted = fit_objective(
+        observations, settings(gp_position_source='readback'), metric)
+    requested, requested_fitted = fit_objective(observations, settings(), metric)
+    reference, _ = fit_objective([observation([0, y]) for y in [0, 1, 2]], settings(), metric)
+    np.testing.assert_array_equal(readback.X_train_, [[0, 1]] * 3)
+    np.testing.assert_array_equal(requested.X_train_, [[0, 0], [0, 1], [0, 2]])
+    assert not readback_fitted and requested_fitted
+    np.testing.assert_allclose(requested.predict([[0, .5], [0, 1.5]]),
+                               reference.predict([[0, .5], [0, 1.5]]))
+    assert all(obs['position'] == [0, 1] for obs in observations)
+
+
+def test_requested_gp_keeps_recorded_readback(tmp_path):
+    class Quantized(SyntheticBackend):
+        def move_absolute(self, target):
+            super().move_absolute([target[0], 1.])
+
+    c = Controller(settings(gp_position_source='requested', readback_tolerance=3),
+                   Quantized([0, 1]), tmp_path / 'log', observation)
+    obs = c.acquire([0, 2], 'Measure requested position.', 'stage_2')
+    recorded = events(c)[-1]['observation']
+    assert recorded['position'] == [0, 1]
+    assert recorded['target'] == [0, 2]
+    gp, _ = fit_objective([obs], c.s)
+    np.testing.assert_array_equal(gp.X_train_, [[0, 2]])
+
+
+def test_invalid_gp_position_source():
+    with pytest.raises(ValueError, match='gp_position_source'):
+        settings(gp_position_source='other').validate()
+
+
 def test_gp_noise_tracks_eligible_observation_stages():
     observations = []
     stages = ['baseline', 'stage1', 'stage1_init', 'stage_2_init', 'stage_2', 'final', None]
@@ -92,12 +130,13 @@ def test_stage1_noise_reduces_influence_on_gp_prediction():
     assert 0. < weighted.predict([[0, 0]])[0] < equal.predict([[0, 0]])[0]
 
 
-def test_readback_fault_stops_without_recovery_motion(tmp_path):
+@pytest.mark.parametrize('source', ['readback', 'requested'])
+def test_readback_fault_stops_without_recovery_motion(tmp_path, source):
     class Faulty(SyntheticBackend):
         def move_absolute(self, target):
             super().move_absolute(np.array(target) + [1, 0])
     backend = Faulty([10, 0])
-    result = Controller(settings(), backend, tmp_path / "log",
+    result = Controller(settings(gp_position_source=source), backend, tmp_path / "log",
                         lambda p: observation(p)).run()
     assert result["status"] == "blocked"
     assert "readback" in result["reason"]
@@ -654,6 +693,7 @@ def test_stage1_budget_validation_preserves_stage2_and_confirmations(value):
 def test_bundled_config_needs_no_calibration():
     runtime = json.loads((Path(__file__).resolve().parents[1] / 'alignment.json').read_text())
     Settings(**runtime).validate()
+    assert runtime['gp_position_source'] == 'requested'
     assert 'eta' not in runtime
     assert 'centroid_percentile' not in runtime
 

@@ -40,6 +40,7 @@ class Settings:
     bo_initialization: str = "grid"
     stage_1_optimizer: str = "quadratic"
     gp_noise: float = 0.05
+    gp_position_source: str = "requested"
     stage_2_gp_stage_1_noise_multiplier: float = 3.0
     ei_xi: float = 0.0
     stage_2_min_ei: float = 0.0
@@ -89,6 +90,8 @@ class Settings:
             raise ValueError("stage_2_eligibility_m1 must be finite and positive")
         if self.bo_initialization not in {"random", "grid"}:
             raise ValueError("bo_initialization must be 'random' or 'grid'")
+        if self.gp_position_source not in {"readback", "requested"}:
+            raise ValueError("gp_position_source must be 'readback' or 'requested'")
         if self.stage_1_optimizer not in {"bo", "quadratic"}:
             raise ValueError("stage_1_optimizer must be 'bo' or 'quadratic'")
         if self.stage_1_optimizer == "quadratic" and self.bo_initialization != "grid":
@@ -148,11 +151,16 @@ def objective_observations(observations, settings, metric):
 
 
 def fit_objective(observations, settings, metric="secondary_metric"):
-    """Model every finite M1, or only eligible M2, including repeated measurements."""
+    """Model finite M1 or eligible M2 at the configured coordinates in motor units.
+
+    Requested coordinates assume the image was acquired at its commanded target.
+    Repeated measurements are retained for either coordinate source.
+    """
     eligible = objective_observations(observations, settings, metric)
     if not eligible:
         raise ValueError("Expected improvement needs an eligible observation")
-    x = np.array([o["position"] for o in eligible])
+    position_key = "target" if settings.gp_position_source == "requested" else "position"
+    x = np.array([o[position_key] for o in eligible])
     y = np.array([float(o["metrics"][metric]) for o in eligible])
     noise = np.array([settings.gp_noise * (
         settings.stage_2_gp_stage_1_noise_multiplier

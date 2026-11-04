@@ -22,5 +22,6 @@
   "stage_1_optimizer": "quadratic",
   "stage_1_grid_spacing": 1.0,
   "stage_2_grid_spacing": 0.1,
-  "gp_noise": 0.02
+  "gp_noise": 0.02,
+  "gp_position_source": "requested"
 }
