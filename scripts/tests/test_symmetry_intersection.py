@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from align_osa import Controller, Replay, Settings, intersect_lines, motor_direction, symmetry_line
+from evaluate_alignment import Config, evaluate
 
 
 class Backend:
@@ -125,6 +126,26 @@ def test_budget_stops_without_last_reverse_move(tmp_path):
     assert r['status']=='acquisition_limit' and len(b.moves)==3 and b.acquisitions==4
     assert not c.lines and r['intersection'] is None
     np.testing.assert_allclose(r['final_readback'],[-15,0])
+
+
+def test_reverse_direction_persists_until_next_valid_image(tmp_path):
+    flat = {'image':'flat.tiff', 'metrics':evaluate(np.ones((32,32)), Config(crop_xyxy=(0,0,32,32)))}
+    seq = [observation(valid=False), observation((-1,0),valid=False), flat,
+           observation((0,-1)), observation((0,1),valid=False),
+           observation((1,0),valid=False), observation()]
+    c,b,r = run(tmp_path,seq)
+    assert r['status']=='aligned'
+    np.testing.assert_allclose(b.moves[:6],[[-5,0],[-10,0],[-15,0],[-10,0],[-10,5],[-10,10]])
+    assert [o.get('reverse_direction') for o in c.history] == [
+        [-1,0],[-1,0],[-1,0],None,[0,1],[0,1],None]
+
+
+def test_flat_first_rejection_cannot_seed_reverse_direction(tmp_path):
+    flat = observation(valid=False)
+    flat['metrics']['direction_xy'] = None
+    c,b,r = run(tmp_path,[flat])
+    assert r['status']=='blocked' and not b.moves
+    assert 'brightness direction' in c.history[0]['metrics']['error']
 
 
 def test_nth_axis_at_budget_still_moves_to_intersection(tmp_path):

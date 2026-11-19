@@ -58,7 +58,7 @@ D(R)=\frac{\sum_p |J(p)-J(R(p))|}{2\sum_p J(p)},\qquad
 \]
 
 Accept exactly when this signed gap exceeds `mismatch_relative_tolerance`
-(default 0.10). Multiplying the image by a positive constant preserves both
+(default 0.05). Multiplying the image by a positive constant preserves both
 discrepancies. Each observation reports `d_axis`, `d_perp`, and `intensity_gap`.
 
 ## Axis direction
@@ -68,8 +68,8 @@ line, at spacing no larger than one pixel, using bilinear interpolation. Fit
 `intensity = slope * signed_distance + intercept` with ordinary least squares.
 Choose the sign of the axis vector so fitted intensity increases in that
 direction. The slope is measured in intensity units per pixel. A numerically
-zero slope leaves the brightness direction undefined. A rejected axis needs
-that direction for its reverse move. An accepted axis can use the fitted line
+zero slope leaves the brightness direction undefined. The first rejection in a
+streak needs that direction to initialize its reverse move. An accepted axis can use the fitted line
 orientation for lateral steering.
 
 Image direction `(ux, uy)` maps to unit motor direction `(ux, -uy)`. In motor
@@ -85,8 +85,11 @@ converted into a motor displacement.
 
 ## Search and intersection
 
-Acquire one image at the starting readback. After an ambiguous-axis rejection,
-move opposite the measured brightness direction by `reverse_step_um`. On the
+Acquire one image at the starting readback. The first ambiguous-axis rejection
+sets `reverse_direction` to the unit motor vector opposite the measured brightness
+direction. For each consecutive rejection, propose `reverse_step_um * reverse_direction`
+from the current readback. Target clipping applies to each move. A valid image
+clears the direction, so the next rejection seeds a new one. On the
 first accepted image, seed the lateral direction with the clockwise perpendicular
 to the brightness direction, using the fitter's axis orientation if the profile
 is flat. Start with zero motor-space momentum (µm). At each subsequent accepted
@@ -138,7 +141,7 @@ intersection move and readback verification.
 | `max_acquisitions` | 20 | Total acquisition limit, including the starting image; at least the required line count |
 | `readback_tolerance` | 0.001 | Euclidean target/readback and acquisition-drift tolerance in µm; also permits this per-axis margin when reading global bounds |
 | `evaluator.crop_xyxy` | `[276,73,616,413]` | Integer exclusive detector bounds, or `[]` / `null` for automatic cropping |
-| `evaluator.mismatch_relative_tolerance` | 0.10 | Reject Δ at or below this fraction |
+| `evaluator.mismatch_relative_tolerance` | 0.05 | Reject Δ at or below this fraction |
 | `evaluator.sigma` | 1.5 | Gaussian sigma in pixels for reflection fitting; 0 disables smoothing |
 | `evaluator.angle_samples` | 720 | Samples over the polar angle range 0–360°; corresponding axis angles span 0–180° |
 | `evaluator.angle_bound_deg` | 10 | Local angle half-width |

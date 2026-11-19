@@ -20,8 +20,10 @@ Motor positions and step distances are in micrometers.
 3. Compute the absolute reflection residual for the fitted axis and its
    perpendicular through the closest axis point to the intensity centroid.
    Normalize each residual sum by twice the smoothed crop's integrated intensity.
-   Reject if `D_perp − D_axis <= mismatch_relative_tolerance` (default 0.10).
-   After rejection, move opposite the directed axis by `reverse_step_um` (default 5).
+   Reject if `D_perp − D_axis <= mismatch_relative_tolerance` (default 0.05).
+   On the first rejection, move opposite the measured brightness direction by
+   `reverse_step_um` (default 5). Reuse that direction for consecutive
+   rejections. The next valid image ends the streak.
 4. For an accepted axis, store a motor-space line through the acquisition's
    actual readback. The first accepted axis seeds the lateral move on the
    clockwise side of the brightness direction. From the second accepted axis

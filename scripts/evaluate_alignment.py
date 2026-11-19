@@ -23,7 +23,7 @@ class Config:
     offset_bound_px: float = 10.
     max_candidates: int = 3
     evaluation_step: int = 2
-    mismatch_relative_tolerance: float = 0.10
+    mismatch_relative_tolerance: float = 0.05
 
     def validate(self):
         crop = self.crop_xyxy
@@ -184,7 +184,7 @@ def evaluate(image, config=Config(), *, first_image_crop=None):
         result.update(d_axis=fit["d_axis"], d_perp=fit["d_perp"], intensity_gap=gap)
         valid = gap > config.mismatch_relative_tolerance
         result.update(directed_axis(patch, fit["axis_point_xy_px"], fit["axis_direction_xy"],
-                                    require_direction=not valid))
+                                    require_direction=False))
         result["valid"] = valid
         if not result["valid"]:
             result["reasons"].append("Signed intensity gap is at or below the acceptance threshold")

@@ -179,6 +179,21 @@ class Controller:
         observation.update(line=line, motor_direction=direction.tolist(),
                            lateral_direction=lateral.tolist(), momentum_um=self.momentum.tolist())
 
+    def reject_axis(self, observation, image_axis):
+        """Carry the first rejection's motor-space reverse vector through consecutive rejections."""
+        direction = motor_direction(image_axis) if image_axis is not None else None
+        if direction is not None:
+            observation["motor_direction"] = direction.tolist()
+        previous = self.current.get("reverse_direction") if self.current else None
+        if previous is not None:
+            observation["reverse_direction"] = previous
+        elif direction is not None:
+            observation["reverse_direction"] = (-direction).tolist()
+        else:
+            error = "First rejected image has no brightness direction for the reverse step"
+            observation["metrics"]["error"] = error
+            observation["metrics"]["reasons"].append(error)
+
     def acquire(self):
         if self.acquisitions >= self.s.max_acquisitions:
             raise RuntimeError("Acquisition budget exhausted")
@@ -212,7 +227,7 @@ class Controller:
                     image_axis = metrics["fit"]["axis_direction_xy"]
                 self.accept_axis(observation, after, motor_direction(image_axis))
             else:
-                observation["motor_direction"] = motor_direction(image_axis).tolist()
+                self.reject_axis(observation, image_axis)
         observation["valid_axes_count"] = len(self.lines)
         self.history.append(observation)
         self.current = observation
@@ -244,8 +259,8 @@ class Controller:
                     step = np.array(observation["lateral_direction"]) * self.s.lateral_step_um
                     purpose = "Accepted axis: move along selected perpendicular"
                 else:
-                    step = -np.array(observation["motor_direction"]) * self.s.reverse_step_um
-                    purpose = "Rejected axis: move opposite its brightness direction"
+                    step = np.array(observation["reverse_direction"]) * self.s.reverse_step_um
+                    purpose = "Rejected axis: move along the current reverse direction"
                 self.move(np.array(observation["position"]) + step, purpose)
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"

@@ -19,6 +19,6 @@
   "evaluator": {
     "crop_xyxy": [276, 73, 616, 413],
     "sigma": 1.5,
-    "mismatch_relative_tolerance": 0.1
+    "mismatch_relative_tolerance": 0.05
   }
 }
