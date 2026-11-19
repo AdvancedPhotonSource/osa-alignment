@@ -43,7 +43,7 @@ th, td { padding: 8px; text-align: left; border-bottom: 1px solid #e8eef2; white
 <div class="card"><div class="muted">Run status</div><div id="status" class="value">Waiting</div></div>
 <div class="card"><div class="muted">Acquisitions / budget</div><div id="count" class="value">—</div></div>
 <div class="card"><div class="muted">Valid axes / required</div><div id="accepted" class="value">—</div></div>
-<div class="card"><div class="muted">Latest mismatch difference</div><div id="difference" class="value">—</div></div>
+<div class="card"><div class="muted">Latest acceptance gap</div><div id="difference" class="value">—</div></div>
 </div>
 <div class="charts">
 <section class="card"><div class="image-heading"><h2 id="image-title">Latest acquired image</h2><button id="go-live" type="button" disabled>Go to live</button></div><figure><img id="image" alt="OSA crop with directed symmetry axis" hidden><figcaption><div id="image-filename"></div><div id="image-note">Waiting for an image</div></figcaption></figure></section>
@@ -51,7 +51,7 @@ th, td { padding: 8px; text-align: left; border-bottom: 1px solid #e8eef2; white
 </div>
 <div id="plot-cursor" hidden></div>
 <section class="card" style="margin-top:16px"><h2>Current activity</h2><div id="updated" class="muted"></div><p id="message"></p><p id="final" class="muted"></p></section>
-<section class="card" style="margin-top:16px"><h2>Acquisition history</h2><p class="muted">Click an acquisition to view its image. E is the reflection mismatch; Δ is |E⊥ − E| / max(E⊥, E). Image angles run clockwise from the right; motor coordinates use +y upward.</p><div class="scroll"><table><thead><tr><th>#</th><th>Decision</th><th>Motor x</th><th>Motor y</th><th>E</th><th>E⊥</th><th>Δ</th><th>Axis angle (°)</th><th>Intensity slope / px</th><th>Motor direction</th><th>Reason</th></tr></thead><tbody id="history"></tbody></table></div></section>
+<section class="card" style="margin-top:16px"><h2>Acquisition history</h2><p class="muted">Click an acquisition to view its image. <span id="gap-definition">The gap is D⊥ − D, using intensity-normalized absolute reflection errors.</span> Image angles run clockwise from the right; motor coordinates use +y upward.</p><div class="scroll"><table><thead><tr><th>#</th><th>Decision</th><th>Motor x</th><th>Motor y</th><th>Axis mismatch</th><th>Perpendicular mismatch</th><th>Gap</th><th>Axis angle (°)</th><th>Intensity slope / px</th><th>Motor direction</th><th>Reason</th></tr></thead><tbody id="history"></tbody></table></div></section>
 <section class="card" style="margin-top:16px"><h2>Run settings</h2><p id="mode" class="muted"></p><pre id="settings"></pre></section>
 <script>
 const initialState = /* INITIAL_STATE */ null;
@@ -262,7 +262,12 @@ function render(state) {
   byId('status').textContent = state.result?.status ?? (latest?.stage ?? 'Starting');
   byId('count').textContent = `${state.result?.acquisitions ?? rows.length} / ${settings.max_acquisitions ?? '—'}`;
   byId('accepted').textContent = `${rows.filter(o => o.line).length} / ${settings.valid_axes_required ?? '—'}`;
-  byId('difference').textContent = finite(latest?.metrics.relative_mismatch_difference) ? `${format(100*latest.metrics.relative_mismatch_difference)}%` : '—';
+  const gap = latest?.metrics.intensity_gap ?? latest?.metrics.relative_mismatch_difference;
+  byId('difference').textContent = finite(gap) ? `${format(100*gap)}%` : '—';
+  const legacy = rows.some(o => finite(o.metrics.relative_mismatch_difference) && !finite(o.metrics.intensity_gap));
+  byId('gap-definition').textContent = legacy
+    ? 'The recorded gap is |E⊥ − E| / max(E⊥, E), using squared reflection errors.'
+    : 'The gap is D⊥ − D, using intensity-normalized absolute reflection errors.';
   byId('mode').textContent = `${state.replay ? 'Recorded-image replay' : 'Adapter acquisition'} · Motor units: ${settings.units ?? '—'}`;
   byId('settings').textContent = Object.entries(settings).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
   byId('message').textContent = state.message;
@@ -275,8 +280,9 @@ function render(state) {
     tr.addEventListener('click', () => selectImage(o));
     const m = o.metrics;
     const decision = m.error ? 'Failed' : m.valid ? 'Accepted' : 'Rejected';
-    for (const value of [o.acquisition, decision, ...o.position.map(format), format(m.reflection_mismatch), format(m.perpendicular_mismatch),
-      finite(m.relative_mismatch_difference) ? `${format(100*m.relative_mismatch_difference)}%` : '—',
+    const gap = m.intensity_gap ?? m.relative_mismatch_difference;
+    for (const value of [o.acquisition, decision, ...o.position.map(format), format(m.d_axis ?? m.reflection_mismatch), format(m.d_perp ?? m.perpendicular_mismatch),
+      finite(gap) ? `${format(100*gap)}%` : '—',
       format(m.fit?.angle_deg), format(m.profile_slope_intensity_per_px), formatPair(o.motor_direction), (m.reasons ?? []).join('; ')]) {
       const td = document.createElement('td'); td.textContent = value; tr.append(td);
     }

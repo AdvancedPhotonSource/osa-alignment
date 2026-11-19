@@ -108,14 +108,15 @@ def test_axis_segment_vertical_and_outside():
         axis_segment([100,10],[0,1],(32,40))
 
 
-@pytest.mark.parametrize('axis,perpendicular,tolerance,valid',[(.9,1,.1,False),(.8,1,.1,True),(0,0,.1,False),(1,.9,.11,False),(.8,1,.25,False)])
-def test_relative_difference_rule(monkeypatch,axis,perpendicular,tolerance,valid):
+@pytest.mark.parametrize('axis,perpendicular,tolerance,valid',[(0,.1,.1,False),(.01,.02,.1,False),(.02,.13,.1,True),(0,0,.1,False),(.8,.2,.1,False)])
+def test_signed_intensity_gap_rule(monkeypatch,axis,perpendicular,tolerance,valid):
     import evaluate_alignment as module
     fit={'axis_point_xy_px':[47,47],'axis_direction_xy':[1,0],
-         'mismatch':axis,'perpendicular_mismatch':perpendicular,'angle_deg':0}
+         'd_axis':axis,'d_perp':perpendicular,'mismatch':.01,'perpendicular_mismatch':.02,'angle_deg':0}
     monkeypatch.setattr(module,'fit_symmetry',lambda *a,**k:dict(best_axis=fit,centroid_xy_px=[47,47],fft_score_range=0,candidates=[fit]))
     _,xx=np.indices((96,96))
     result=evaluate(1+xx.astype(float),config(mismatch_relative_tolerance=tolerance))
+    assert result['intensity_gap']==pytest.approx(perpendicular-axis)
     assert result['valid'] is valid
     assert not result['error']
 
@@ -159,6 +160,8 @@ def test_refinement_corrects_centroid_bias_and_intensity_scale():
     assert abs(best['offset_px'])>.05
     assert abs((best['angle_deg']-37.3+90)%180-90)<.5
     assert best['angle_deg']==pytest.approx(b['best_axis']['angle_deg'],abs=1e-5)
+    for key in ('d_axis','d_perp'):
+        assert best[key]==pytest.approx(b['best_axis'][key],abs=1e-7)
 
 
 def test_actual_image_closed_loop(tmp_path):

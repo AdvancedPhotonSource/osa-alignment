@@ -153,8 +153,8 @@ def evaluate(image, config=Config(), *, first_image_crop=None):
     """Return symmetry geometry, brightness direction, and mono-axial acceptance.
 
     Perpendicular mismatch is evaluated through the fitted axis point closest
-    to the intensity centroid, without a second optimization. Closeness is
-    |Eperp-Eaxis| / max(Eperp,Eaxis); both-zero mismatch also rejects the axis.
+    to the intensity centroid. Accept when D_perp - D_axis exceeds the threshold,
+    where D is the absolute reflection residual divided by twice the smoothed crop intensity sum.
     Configuration errors raise; measurement failures remain in acquisition history.
     """
     config.validate()
@@ -179,9 +179,11 @@ def evaluate(image, config=Config(), *, first_image_crop=None):
         a, b = fit["mismatch"], fit["perpendicular_mismatch"]
         relative = abs(b - a) / max(a, b) if max(a, b) > 0 else 0.
         result.update(reflection_mismatch=a, perpendicular_mismatch=b, relative_mismatch_difference=relative)
-        result["valid"] = relative > config.mismatch_relative_tolerance
+        gap = fit["d_perp"] - fit["d_axis"]
+        result.update(d_axis=fit["d_axis"], d_perp=fit["d_perp"], intensity_gap=gap)
+        result["valid"] = gap > config.mismatch_relative_tolerance
         if not result["valid"]:
-            result["reasons"].append("Axis and perpendicular reflection mismatches are too close")
+            result["reasons"].append("Signed intensity gap is at or below the acceptance threshold")
     except (ValueError, RuntimeError) as exc:
         result["error"] = str(exc)
         result["reasons"].append(str(exc))

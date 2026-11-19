@@ -18,20 +18,21 @@ Motor positions and step distances are in micrometers.
 2. Sample the original pixel intensities along the fitted axis and fit a line
    against signed pixel distance. Orient the axis toward increasing fitted
    intensity.
-3. Compare reflection mismatch E about this axis with E⊥ about its perpendicular
-   through the closest axis point to the intensity centroid. Reject if
-   `abs(E⊥ − E) / max(E⊥, E) <= mismatch_relative_tolerance` (default 0.10).
-   Both-zero mismatch also rejects. After rejection, move opposite the directed
-   axis by `reverse_step_um` (default 5).
+3. Compute the absolute reflection residual for the fitted axis and its
+   perpendicular through the closest axis point to the intensity centroid.
+   Normalize each residual sum by twice the smoothed crop's integrated intensity.
+   Reject if `D_perp − D_axis <= mismatch_relative_tolerance` (default 0.10).
+   After rejection, move opposite the directed axis by `reverse_step_um` (default 5).
 4. For an accepted axis, store a motor-space line through the acquisition's
    actual readback, oriented by the mapped image axis. Move to the axis's
    3 o'clock side by `lateral_step_um` (default 5).
 5. As soon as `valid_axes_required` lines have been stored (default 6), solve
-   their unweighted least-squares intersection and move directly there. This
+   their unweighted least-squares intersection and use it as the move target. This
    replaces the lateral move after the last required axis and completes the run.
 
+Clip each search and intersection move per axis to the configured motor bounds.
 Stop at the current position on an acquisition/fitting/direction failure,
-rank-deficient intersection, motor fault, or out-of-bounds target. Stop after
+rank-deficient intersection, or motor fault. Stop after
 `max_acquisitions` images (default 20) if too few axes were accepted. These stops
 perform no additional motor move. A successful result reports the intersection
 and final readback; the most recent image is the last search acquisition.

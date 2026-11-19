@@ -49,16 +49,17 @@ relative convergence tolerance remains meaningful near zero mismatch. Select
 the lowest-mismatch result; failure of that selected fit stops evaluation.
 
 The perpendicular axis passes through the fitted axis point closest to the
-centroid. Evaluate its mismatch on the same fixed grid, with no independent
-position/angle optimization. The mono-axial acceptance measure is
+centroid. On the final unit-spaced, zero-padded grid, compute the absolute
+reflection discrepancy for each orientation using the smoothed crop \(J\).
 
 \[
-\Delta = |E_\perp-E|/\max(E_\perp,E).
+D(R)=\frac{\sum_p |J(p)-J(R(p))|}{2\sum_p J(p)},\qquad
+\Delta=D_\perp-D_{\rm axis}.
 \]
 
-Accept exactly when Δ exceeds `mismatch_relative_tolerance` (default 0.10).
-When both errors are zero, Δ is defined to be zero. The procedure uses this
-relative test as its acceptance criterion.
+Accept exactly when this signed gap exceeds `mismatch_relative_tolerance`
+(default 0.10). Multiplying the image by a positive constant preserves both
+discrepancies. Each observation reports `d_axis`, `d_perp`, and `intensity_gap`.
 
 ## Axis direction
 
@@ -91,12 +92,14 @@ As soon as the required line count is reached, solve
  p_* = \arg\min_p\sum_i(n_i^T p-b_i)^2
 \]
 
-and move directly to `p_*`. Unit normals make the residuals perpendicular
+and use `p_*` as the final move target. Unit normals make the residuals perpendicular
 motor-space distances in micrometers. All accepted lines receive equal weight.
 The solver centers motor coordinates for numerical conditioning and reports
 rank, condition number, residuals, and RMS distance. Rank below two stops the
-run because the intersection is not unique. Motor bounds apply to the complete
-intersection target as well as each search target; targets are never clipped.
+run because the intersection is not unique. Each search and intersection move
+clips x and y independently to their configured motor bounds. The move plan
+records the proposed and bounded targets. Intersection diagnostics use the
+unconstrained fit, and readback verification uses the bounded target.
 
 The controller reads position before and after every acquisition and move.
 Actual readbacks anchor the stored lines. The final search acquisition and the
@@ -197,7 +200,7 @@ JSONL records settings, acquisition attempts, observations, move plans, complete
 moves, the intersection, faults, and completion. A fresh log path is required.
 Image/fitting failures remain available in history when an image was acquired.
 
-- `aligned`: enough valid lines were collected and the intersection move passed
+- `aligned`: enough valid lines were collected and the bounded intersection move passed
   readback verification.
 - `acquisition_limit`: the image limit was reached with too few accepted axes;
   no further search move is issued.

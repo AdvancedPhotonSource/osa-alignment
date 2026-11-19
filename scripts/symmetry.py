@@ -68,14 +68,17 @@ def fit_symmetry(image, sigma=1.5, angle_samples=720, angle_bound_deg=10,
     coarse_grid = evaluation_grid(evaluation_step)
     full_grid = evaluation_grid(1)
 
-    def mismatch(angle, offset, grid):
-        grid_x, grid_y, original = grid
+    def reflect(angle, offset, grid):
+        grid_x, grid_y, _ = grid
         nx, ny = -np.sin(angle), np.cos(angle)
         distance = nx * (grid_x - center[0]) + ny * (grid_y - center[1]) - offset
-        reflected = map_coordinates(smooth,
+        return map_coordinates(smooth,
                                     [grid_y - 2 * ny * distance,
                                      grid_x - 2 * nx * distance],
                                     order=1, mode='grid-constant', cval=0, prefilter=False)
+    def mismatch(angle, offset, grid):
+        original = grid[2]
+        reflected = reflect(angle, offset, grid)
         return float(np.sum((original - reflected)**2)
                      / (np.sum(original**2) + np.sum(reflected**2)))
 
@@ -120,8 +123,16 @@ def fit_symmetry(image, sigma=1.5, angle_samples=720, angle_bound_deg=10,
     point = np.array(best['axis_point_xy_px'])
     perpendicular_angle = angle + np.pi / 2
     perpendicular_normal = np.array([-np.sin(perpendicular_angle), np.cos(perpendicular_angle)])
-    best['perpendicular_mismatch'] = mismatch(
-        perpendicular_angle, float((point - center) @ perpendicular_normal), full_grid)
+    perpendicular_offset = float((point - center) @ perpendicular_normal)
+    original = full_grid[2]
+    along = reflect(angle, best['offset_px'], full_grid)
+    across = reflect(perpendicular_angle, perpendicular_offset, full_grid)
+    best['perpendicular_mismatch'] = float(np.sum((original - across)**2)
+                                          / (np.sum(original**2) + np.sum(across**2)))
+    # Integrate absolute residuals over the full zero-padded pixel grid.
+    normalization = 2 * smooth.sum()
+    best['d_axis'] = float(np.abs(original - along).sum() / normalization)
+    best['d_perp'] = float(np.abs(original - across).sum() / normalization)
     return {
         'centroid_xy_px': center.tolist(),
         'best_axis': candidates[0],

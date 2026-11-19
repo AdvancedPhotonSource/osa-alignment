@@ -141,12 +141,13 @@ class Controller:
 
     def move(self, target, purpose):
         before = self.position()
-        target = np.asarray(target, float)
+        proposed = np.asarray(target, float)
         bounds = np.asarray(self.s.bounds)
-        if (target.shape != (2,) or not np.isfinite(target).all()
-            or np.any(target < bounds[:, 0]) or np.any(target > bounds[:, 1])):
-            raise RuntimeError("Proposed move exceeds motor bounds")
+        if proposed.shape != (2,) or not np.isfinite(proposed).all():
+            raise RuntimeError("Proposed move requires two finite motor coordinates")
+        target = np.clip(proposed, bounds[:, 0], bounds[:, 1])
         self.record("plan", text=f"{purpose}: move to {target.tolist()} um.",
+                    proposed_target=proposed.tolist(),
                     target=target.tolist(), previous_readback=before.tolist(), purpose=purpose)
         if np.linalg.norm(target - before) > 1e-12:
             self.backend.move_absolute(target.tolist())
@@ -213,7 +214,7 @@ class Controller:
                     self.record("intersection", intersection=self.intersection,
                                 text=f"Least-squares intersection: {self.intersection['position']} um.")
                     self.move(self.intersection["position"], "Move to symmetry intersection")
-                    status, reason = "aligned", "Moved to the least-squares symmetry intersection"
+                    status, reason = "aligned", "Completed move to the bounded symmetry-intersection target"
                     break
                 if self.acquisitions == self.s.max_acquisitions:
                     status, reason = "acquisition_limit", "Acquisition limit reached before collecting enough valid axes"

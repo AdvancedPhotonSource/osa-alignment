@@ -117,15 +117,30 @@ def test_parallel_lines_stop_without_final_motion(tmp_path):
     assert len(b.moves)==1 and b.acquisitions==2
 
 
-def test_out_of_bounds_search_stops_without_clipping(tmp_path):
-    _,b,r=run(tmp_path,[observation(valid=False)],bounds=[[-2,2],[-2,2]])
-    assert r['status']=='blocked' and 'bounds' in r['reason'] and not b.moves
+def test_search_clips_each_axis_and_reacquires_at_boundary(tmp_path):
+    c,b,r=run(tmp_path,[observation(valid=False) for _ in range(3)],
+              bounds=[[-2,2],[-2,2]],max_acquisitions=3)
+    assert r['status']=='acquisition_limit' and b.moves==[[-2,0]]
+    assert [o['position'] for o in c.history]==[[0,0],[-2,0],[-2,0]]
+    plan=next(e for e in map(json.loads,c.log_path.read_text().splitlines()) if e['event']=='plan')
+    assert plan['proposed_target']==[-5,0] and plan['target']==[-2,0]
 
 
-def test_out_of_bounds_intersection_stops_at_last_acquisition(tmp_path):
-    _,b,r=run(tmp_path,[observation(),observation((1,-.05))],bounds=[[-10,10],[-10,10]])
-    assert r['status']=='blocked' and 'bounds' in r['reason'] and len(b.moves)==1
-    assert r['intersection']['position'][0] > 90
+def test_search_and_intersection_use_bounded_targets(tmp_path):
+    _,b,r=run(tmp_path,[observation(),observation((1,-.05))],bounds=[[-10,10],[-4,10]])
+    assert r['status']=='aligned'
+    np.testing.assert_allclose(b.moves,[[0,-4],[10,0]],atol=1e-12)
+    np.testing.assert_allclose(r['intersection']['position'],[80,0],atol=1e-12)
+    np.testing.assert_allclose(r['final_readback'],[10,0],atol=1e-12)
+
+
+@pytest.mark.parametrize('target', [[float('nan'),0],[0,float('inf')],[0]])
+def test_invalid_move_targets_still_fail(tmp_path,target):
+    backend=Backend()
+    controller=Controller(settings(),backend,tmp_path/'run')
+    with pytest.raises(RuntimeError,match='finite motor coordinates'):
+        controller.move(target,'test')
+    assert not backend.moves
 
 
 def test_bad_readback_no_recovery_motion(tmp_path):
