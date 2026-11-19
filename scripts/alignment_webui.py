@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 from threading import Thread
+from time import sleep
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -20,6 +21,7 @@ class Dashboard:
         self.log_path = Path(log_path)
         self.snapshot_path = self.log_path.with_suffix(".html")
         self.template = Path(__file__).with_name("alignment_webui.html").read_text()
+        self._has_polled = False
         dashboard = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -27,6 +29,7 @@ class Dashboard:
                 if self.path == "/":
                     body, content_type = dashboard.html().encode(), "text/html; charset=utf-8"
                 elif self.path == "/api/status":
+                    dashboard._has_polled = True
                     body = json.dumps(dashboard.state(), allow_nan=False).encode()
                     content_type = "application/json"
                 elif match := re.fullmatch(r"/api/images/([1-9][0-9]*)", self.path):
@@ -149,8 +152,12 @@ class Dashboard:
 
     def close(self):
         try:
+            state = self.state()
+            if state["result"] is not None and self._has_polled:
+                # Allow the next one-second browser poll to receive the completed run.
+                sleep(2)
             with self.snapshot_path.open("x") as stream:
-                stream.write(self.html(self.state()))
+                stream.write(self.html(state))
             print(f"OSA dashboard snapshot: {self.snapshot_path.resolve()}", flush=True)
         except (OSError, ValueError) as exc:
             print(f"Could not save dashboard snapshot: {exc}", flush=True)

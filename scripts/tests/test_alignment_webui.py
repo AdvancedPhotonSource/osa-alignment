@@ -1,9 +1,11 @@
 """Read-only symmetry dashboard, overlays, acquisition history, and CLI lifecycle."""
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
 from pathlib import Path
 import sys
+from time import sleep
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -52,6 +54,29 @@ def test_live_state_read_only_routes_and_moves(tmp_path):
         html=request(dashboard,'').read()
         assert b'Symmetry lines and search trajectory' in html and b'Shift-drag to zoom' in html
     finally:dashboard.close()
+    assert dashboard.snapshot_path.exists() and not dashboard.thread.is_alive()
+
+
+def test_next_live_poll_receives_final_intersection(tmp_path):
+    observations = iter([observation((0, -1)), observation((1, -1))])
+    controller = align_osa.Controller(settings(), Backend(), tmp_path/'run.jsonl',
+                                      lambda _: next(observations))
+    dashboard = Dashboard(controller.log_path, port=0)
+    dashboard.start()
+    try:
+        with request(dashboard) as response:
+            assert json.load(response)['result'] is None
+        result = controller.run()
+    finally:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            closing = executor.submit(dashboard.close)
+            # The browser polls one second after receiving its previous response.
+            sleep(1)
+            with request(dashboard) as response:
+                final = json.load(response)
+            closing.result(timeout=5)
+    assert final['result']['status'] == 'aligned'
+    assert final['intersection'] == result['intersection']
     assert dashboard.snapshot_path.exists() and not dashboard.thread.is_alive()
 
 
