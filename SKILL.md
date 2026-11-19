@@ -31,15 +31,16 @@ Motor positions and step distances are in micrometers.
    (exponential weight `beta`, default 0.5). Choose the perpendicular that
    points along that momentum and move `lateral_step_um` (bundled value 15 µm).
 5. As soon as `valid_axes_required` lines have been stored (default 6), solve
-   their unweighted least-squares intersection and use it as the move target. This
-   replaces the lateral move after the last required axis and completes the run.
+   their unweighted least-squares intersection and use it as the move target.
+   In adapter runs, acquire one final image after verifying the motor readback.
 
 Clip each search and intersection move per axis to the configured motor bounds.
 Stop at the current position on an acquisition/fitting/direction failure,
 rank-deficient intersection, or motor fault. Stop after
-`max_acquisitions` images (default 20) if too few axes were accepted. These stops
-perform no additional motor move. A successful result reports the intersection
-and final readback; the most recent image is the last search acquisition.
+`max_acquisitions` search images (default 20) if too few axes were accepted.
+These stops perform no additional motor move. A successful adapter run reports
+the intersection, final readback, and final image. The final image is for visual
+inspection and is separate from the search budget.
 
 ## Run
 

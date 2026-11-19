@@ -124,9 +124,10 @@ records the proposed and bounded targets. Intersection diagnostics use the
 unconstrained fit, and readback verification uses the bounded target.
 
 The controller reads position before and after every acquisition and move.
-Actual readbacks anchor the stored lines. The final search acquisition and the
-final motor readback are separate result fields. Completion consists of the
-intersection move and readback verification.
+Actual readbacks anchor the stored lines. After verifying the intersection move,
+the adapter captures one final image at the bounded readback. The dashboard uses
+the search crop for that image. The frame is for visual inspection and is acquired
+outside the search budget.
 
 ## Alignment settings
 
@@ -138,7 +139,7 @@ intersection move and readback verification.
 | `reverse_step_um` | 5 | Reverse-axis displacement after rejection |
 | `lateral_step_um` | 5 | Perpendicular displacement after acceptance. The bundled configuration sets 15 µm. |
 | `beta` | 0.5 | Weight of the newest accepted-readback displacement in the momentum update, in (0, 1] |
-| `max_acquisitions` | 20 | Total acquisition limit, including the starting image; at least the required line count |
+| `max_acquisitions` | 20 | Search acquisition limit, including the starting image; at least the required line count |
 | `readback_tolerance` | 0.001 | Euclidean target/readback and acquisition-drift tolerance in µm; also permits this per-axis margin when reading global bounds |
 | `evaluator.crop_xyxy` | `[276,73,616,413]` | Integer exclusive detector bounds, or `[]` / `null` for automatic cropping |
 | `evaluator.mismatch_relative_tolerance` | 0.05 | Reject Δ at or below this fraction |
@@ -195,11 +196,11 @@ uv run --project scripts --locked python scripts/align_osa.py \
   --log replay.jsonl --output replay-result.json --webui
 ```
 
-Replay requires an image at every exact acquisition position requested by the
-workflow; repeated images at one position cycle through that position's files.
-The final intersection move needs no recorded image because it performs no
-acquisition. Missing search positions stop replay. Sparse regular scans will
-usually lack the continuous positions required by the directed workflow.
+Replay requires an image at every exact search acquisition position requested by
+the workflow. Repeated images at one position cycle through that position's
+files. Replay ends after verifying the intersection move. Missing search
+positions stop replay. Sparse regular scans will usually lack the continuous
+positions required by the directed workflow.
 
 ## Live dashboard
 
@@ -208,8 +209,10 @@ usually lack the continuous positions required by the directed workflow.
 forward. It polls the JSONL log once per second. All motor control remains in
 the controller.
 
-The top row shows the latest cropped acquisition with its axis and brightness
-arrow, plus accepted motor-space lines, the readback trajectory, and intersection.
+The top row shows the latest cropped acquisition alongside the accepted
+motor-space lines, readback trajectory, and intersection. Search images show
+the fitted axis and brightness arrow. The frame acquired after the intersection
+move is labeled Final image.
 The trajectory has equal motor-coordinate scales. Drag to pan, Shift-drag to
 zoom, and Reset view to return to the full range. Acquisition history includes
 accept/reject/failure, motor position, both mismatches, Δ, axis angle, fitted
@@ -223,15 +226,16 @@ JSONL records settings, acquisition attempts, observations, move plans, complete
 moves, the intersection, faults, and completion. A fresh log path is required.
 Image/fitting failures remain available in history when an image was acquired.
 
-- `aligned`: enough valid lines were collected and the bounded intersection move passed
-  readback verification.
+- `aligned`: enough valid lines were collected, the bounded intersection move
+  passed readback verification, and the adapter captured the final image.
+  Replay completes at readback verification.
 - `acquisition_limit`: the image limit was reached with too few accepted axes;
   no further search move is issued.
 - `blocked`: fitting/direction, readback, acquisition, bounds, or intersection
   failure; no recovery move is issued.
 
-The result includes the actual `final_readback`, `final_observation`, accepted
-`lines`, `intersection` diagnostics, and counts. A non-aligned run exits with code
-2. Nearly parallel accepted lines can yield a large condition number; the value
-is reported alongside the inferred intersection. The result describes this
-geometric procedure's outcome, rather than a separate final-image assessment.
+The result includes the actual `final_readback`, the latest `final_observation`,
+accepted `lines`, and `intersection` diagnostics. `acquisitions` counts all image
+requests and `search_acquisitions` counts the requests charged to the search
+budget. A non-aligned run exits with code 2. Nearly parallel accepted lines can
+yield a large condition number reported alongside the inferred intersection.

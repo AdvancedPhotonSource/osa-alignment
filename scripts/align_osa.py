@@ -123,7 +123,7 @@ class Controller:
         self.history, self.lines = [], []
         self.momentum = np.zeros(2)
         self.current, self.intersection = None, None
-        self.acquisitions = 0
+        self.acquisitions = self.search_acquisitions = 0
         self.replay = isinstance(backend, Replay)
         self.record("start", settings=asdict(settings), replay=self.replay)
 
@@ -194,17 +194,7 @@ class Controller:
             observation["metrics"]["error"] = error
             observation["metrics"]["reasons"].append(error)
 
-    def acquire(self):
-        if self.acquisitions >= self.s.max_acquisitions:
-            raise RuntimeError("Acquisition budget exhausted")
-        before = self.position()
-        self.acquisitions += 1
-        self.record("acquiring", acquisition=self.acquisitions, position=before.tolist(),
-                    text=f"Acquire image {self.acquisitions} at {before.tolist()} um.")
-        image = self.backend.acquire_image()
-        after = self.position()
-        if np.linalg.norm(after - before) > self.s.readback_tolerance:
-            raise RuntimeError("Motor position changed during acquisition")
+    def measure_frame(self, image):
         try:
             if self.measurement is None:
                 observation = measure(image, config=self.evaluator, first_image_crop=self.first_image_crop)
@@ -217,30 +207,55 @@ class Controller:
                 "valid": False, "fit": None, "error": str(exc), "reasons": [str(exc)],
                 "config": asdict(self.evaluator),
                 "crop_xyxy": list(self.evaluator.crop_xyxy or self.first_image_crop or ())}}
+        return observation
+
+    def acquire(self, *, final=False):
+        if not final and self.search_acquisitions >= self.s.max_acquisitions:
+            raise RuntimeError("Search acquisition budget exhausted")
+        before = self.position()
+        stage = "final" if final else "search"
+        label = "final image" if final else "image"
+        self.acquisitions += 1
+        if not final:
+            self.search_acquisitions += 1
+        self.record("acquiring", acquisition=self.acquisitions, position=before.tolist(), stage=stage,
+                    text=f"Acquire {label} {self.acquisitions} at {before.tolist()} um.")
+        image = self.backend.acquire_image()
+        after = self.position()
+        if np.linalg.norm(after - before) > self.s.readback_tolerance:
+            raise RuntimeError("Motor position changed during acquisition")
+        if final:
+            configured_crop = list(self.evaluator.crop_xyxy or ())
+            observation = {"image": str(Path(image).resolve()), "line": None, "metrics": {
+                "config": {"crop_xyxy": configured_crop},
+                "crop_xyxy": configured_crop or list(self.first_image_crop or ())}}
+            text = f"Final image {self.acquisitions} acquired at {after.tolist()} um."
+        else:
+            observation = self.measure_frame(image)
+            observation["line"] = None
+            metrics = observation["metrics"]
+            if not metrics.get("error"):
+                image_axis = metrics.get("direction_xy")
+                if metrics["valid"]:
+                    if image_axis is None:
+                        image_axis = metrics["fit"]["axis_direction_xy"]
+                    self.accept_axis(observation, after, motor_direction(image_axis))
+                else:
+                    self.reject_axis(observation, image_axis)
+            state = "failed" if metrics.get("error") else "accepted" if metrics["valid"] else "rejected"
+            text = (f"Image {self.acquisitions}: axis {state}; {len(self.lines)}/{self.s.valid_axes_required} valid axes. "
+                    + "; ".join(metrics.get("reasons", [])))
         observation.update(position=after.tolist(), acquisition=self.acquisitions,
-                           stage="search", line=None)
-        metrics = observation["metrics"]
-        if not metrics.get("error"):
-            image_axis = metrics.get("direction_xy")
-            if metrics["valid"]:
-                if image_axis is None:
-                    image_axis = metrics["fit"]["axis_direction_xy"]
-                self.accept_axis(observation, after, motor_direction(image_axis))
-            else:
-                self.reject_axis(observation, image_axis)
-        observation["valid_axes_count"] = len(self.lines)
+                           stage=stage, valid_axes_count=len(self.lines))
         self.history.append(observation)
         self.current = observation
-        state = "failed" if metrics.get("error") else "accepted" if metrics["valid"] else "rejected"
-        self.record("observation", observation=observation,
-                    text=f"Image {self.acquisitions}: axis {state}; {len(self.lines)}/{self.s.valid_axes_required} valid axes. "
-                         + "; ".join(metrics.get("reasons", [])))
+        self.record("observation", observation=observation, text=text)
         return observation
 
     def run(self):
         status, reason = "blocked", ""
         try:
-            while self.acquisitions < self.s.max_acquisitions:
+            while self.search_acquisitions < self.s.max_acquisitions:
                 observation = self.acquire()
                 metrics = observation["metrics"]
                 if metrics.get("error"):
@@ -250,9 +265,13 @@ class Controller:
                     self.record("intersection", intersection=self.intersection,
                                 text=f"Least-squares intersection: {self.intersection['position']} um.")
                     self.move(self.intersection["position"], "Move to symmetry intersection")
-                    status, reason = "aligned", "Completed move to the bounded symmetry-intersection target"
+                    reason = "Completed move to the bounded symmetry-intersection target"
+                    if not self.replay:
+                        self.acquire(final=True)
+                        reason += " and acquired the final image"
+                    status = "aligned"
                     break
-                if self.acquisitions == self.s.max_acquisitions:
+                if self.search_acquisitions == self.s.max_acquisitions:
                     status, reason = "acquisition_limit", "Acquisition limit reached before collecting enough valid axes"
                     break
                 if metrics["valid"]:
@@ -270,7 +289,8 @@ class Controller:
         except Exception:
             final_position = None
         result = {"status": status, "reason": reason, "replay": self.replay,
-                  "acquisitions": self.acquisitions, "valid_axes_count": len(self.lines),
+                  "acquisitions": self.acquisitions, "search_acquisitions": self.search_acquisitions,
+                  "valid_axes_count": len(self.lines),
                   "lines": self.lines, "intersection": self.intersection,
                   "final_observation": self.current, "final_readback": final_position,
                   "log": str(self.log_path)}

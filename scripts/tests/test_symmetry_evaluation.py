@@ -180,5 +180,9 @@ def test_actual_image_closed_loop(tmp_path):
     c=Controller(settings(valid_axes_required=6,evaluator={'crop_xyxy':[0,0,96,96]}),backend,tmp_path/'run.jsonl')
     result=c.run()
     assert result['status']=='aligned',result['reason']
-    assert result['valid_axes_count']==6 and backend.acquisitions==6
+    assert result['valid_axes_count']==6 and backend.acquisitions==7
+    final = result['final_observation']
+    assert final['image'] == str(tmp_path/'image-7.tiff')
+    assert final['metrics']['crop_xyxy'] == [0,0,96,96]
+    assert final['position'] == result['final_readback']
     np.testing.assert_allclose(result['final_readback'],optimum,atol=.1)

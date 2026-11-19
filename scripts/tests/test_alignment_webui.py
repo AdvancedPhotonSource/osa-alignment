@@ -58,8 +58,13 @@ def test_live_state_read_only_routes_and_moves(tmp_path):
 
 
 def test_next_live_poll_receives_final_intersection(tmp_path):
+    path = tmp_path/'final.tiff'
+    Image.fromarray(np.ones((32,32),np.uint8)).save(path)
+    backend = Backend()
+    backend.acquire_image = lambda: str(path)
     observations = iter([observation((0, -1)), observation((1, -1))])
-    controller = align_osa.Controller(settings(), Backend(), tmp_path/'run.jsonl',
+    controller = align_osa.Controller(settings(evaluator={'crop_xyxy': [0, 0, 32, 32]}),
+                                      backend, tmp_path/'run.jsonl',
                                       lambda _: next(observations))
     dashboard = Dashboard(controller.log_path, port=0)
     dashboard.start()
@@ -77,7 +82,13 @@ def test_next_live_poll_receives_final_intersection(tmp_path):
             closing.result(timeout=5)
     assert final['result']['status'] == 'aligned'
     assert final['intersection'] == result['intersection']
+    assert final['observations'][-1] == result['final_observation']
+    assert final['observations'][-1]['stage'] == 'final'
+    assert final['image'].startswith('data:image/png;base64,')
     assert dashboard.snapshot_path.exists() and not dashboard.thread.is_alive()
+    html = dashboard.snapshot_path.read_text()
+    saved = json.loads(html.split('const initialState = ',1)[1].split(';\n',1)[0])
+    assert saved['observations'][-1]['preview']['image'] == final['image']
 
 
 @pytest.mark.parametrize('size',[200,2000])

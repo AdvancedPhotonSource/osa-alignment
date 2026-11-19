@@ -102,7 +102,7 @@ class Dashboard:
             preview = Image.fromarray(np.uint8(np.clip(scaled * 255, 0, 255))).convert("RGB")
             preview.thumbnail((1000, 1000))
             fit = metrics.get("fit")
-            overlay_note = "No fitted symmetry axis available"
+            overlay_note = "" if observation.get("stage") == "final" else " No fitted symmetry axis available"
             if fit:
                 draw = ImageDraw.Draw(preview)
                 sx, sy = preview.width / pixels.shape[1], preview.height / pixels.shape[0]
@@ -126,13 +126,13 @@ class Dashboard:
                     normal = np.array([-arrow[1], arrow[0]])
                     draw.polygon([tuple(tip_screen), tuple(tip_screen - 12 * arrow + 6 * normal),
                                   tuple(tip_screen - 12 * arrow - 6 * normal)], fill=color)
-                overlay_note = "Symmetry axis: " + ("accepted (cyan)" if metrics.get("valid") else "rejected/failed (orange)")
+                overlay_note = " Symmetry axis: " + ("accepted (cyan)" if metrics.get("valid") else "rejected/failed (orange)")
                 if metrics.get("direction_xy") is not None:
                     overlay_note += "; arrow points toward increasing fitted intensity along the axis."
             buffer = BytesIO()
             preview.save(buffer, format="PNG")
             preview_data["image"] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-            preview_data["image_note"] = (f"Display intensity range: {low:.5g}–{high:.5g} (linear). "
+            preview_data["image_note"] = (f"Display intensity range: {low:.5g}–{high:.5g} (linear)."
                                           + overlay_note)
         except (OSError, ValueError, KeyError) as exc:
             preview_data["image_note"] = f"Image preview unavailable: {exc}"

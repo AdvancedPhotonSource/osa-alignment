@@ -68,11 +68,11 @@ def test_reject_reverse_accept_clockwise_and_final_intersection(tmp_path):
     c,b,r=run(tmp_path,[observation(valid=False),observation((0,-1)),observation((1,-1))])
     assert r['status']=='aligned'
     np.testing.assert_allclose(b.moves,[[-5,0],[0,0],[-5,-5]],atol=1e-12)
-    assert b.acquisitions==3 and len(c.lines)==2
+    assert b.acquisitions==4 and len(c.lines)==2
     np.testing.assert_allclose(r['intersection']['position'],[-5,-5])
     assert r['intersection']['rms_distance_um'] < 1e-12
     assert c.history[0]['line'] is None
-    assert [o['valid_axes_count'] for o in c.history]==[0,1,2]
+    assert [o['valid_axes_count'] for o in c.history]==[0,1,2,2]
 
 
 def test_configured_step_distances(tmp_path):
@@ -89,9 +89,10 @@ def test_momentum_uses_consecutive_accepted_readbacks(tmp_path):
                           observation((0,1)), flat, observation()],
                 bounds=[[-3,3],[-20,20]], valid_axes_required=4, beta=.25)
     assert r['status']=='aligned'
-    first,rejected,second,third,last = c.history
+    first,rejected,second,third,last,final = c.history
     assert 'momentum_um' not in rejected
-    np.testing.assert_allclose([o['position'] for o in c.history],[[0,0],[3,0],[3,5],[3,5],[3,10]])
+    np.testing.assert_allclose([o['position'] for o in c.history[:-1]],[[0,0],[3,0],[3,5],[3,5],[3,10]])
+    assert 'momentum_um' not in final
     np.testing.assert_allclose([o['momentum_um'] for o in (first,second,third,last)],
                                [[0,0],[.75,1.25],[.5625,.9375],[.421875,1.953125]])
     np.testing.assert_allclose(second['lateral_direction'],[1,0])
@@ -137,7 +138,7 @@ def test_reverse_direction_persists_until_next_valid_image(tmp_path):
     assert r['status']=='aligned'
     np.testing.assert_allclose(b.moves[:6],[[-5,0],[-10,0],[-15,0],[-10,0],[-10,5],[-10,10]])
     assert [o.get('reverse_direction') for o in c.history] == [
-        [-1,0],[-1,0],[-1,0],None,[0,1],[0,1],None]
+        [-1,0],[-1,0],[-1,0],None,[0,1],[0,1],None,None]
 
 
 def test_flat_first_rejection_cannot_seed_reverse_direction(tmp_path):
@@ -148,9 +149,34 @@ def test_flat_first_rejection_cannot_seed_reverse_direction(tmp_path):
     assert 'brightness direction' in c.history[0]['metrics']['error']
 
 
-def test_nth_axis_at_budget_still_moves_to_intersection(tmp_path):
-    _,b,r=run(tmp_path,[observation((0,-1)),observation((1,-1))],max_acquisitions=2)
-    assert r['status']=='aligned' and len(b.moves)==2 and b.acquisitions==2
+def test_final_image_after_verified_move_at_search_budget(tmp_path):
+    c,b,r=run(tmp_path,[observation((0,-1)),observation((1,-1))],max_acquisitions=2)
+    assert r['status']=='aligned' and len(b.moves)==2 and b.acquisitions==3
+    assert r['acquisitions']==3 and r['search_acquisitions']==2
+    final = r['final_observation']
+    assert final['stage']=='final' and final['line'] is None and final['acquisition']==3
+    assert final['position']==r['final_readback']
+    events=[json.loads(row) for row in c.log_path.read_text().splitlines()]
+    move,acquiring,observation_event,complete=events[-4:]
+    assert [e['event'] for e in (move,acquiring,observation_event,complete)]==[
+        'move','acquiring','observation','complete']
+    assert move['position']==acquiring['position']==final['position']
+    assert observation_event['observation']==final
+
+
+def test_failed_final_image_blocks_without_another_move(tmp_path):
+    class FailedFinalImage(Backend):
+        def acquire_image(self):
+            if self.acquisitions==2:
+                raise RuntimeError('Final camera acquisition failed')
+            return super().acquire_image()
+    backend=FailedFinalImage()
+    observations=iter([observation((0,-1)),observation((1,-1))])
+    controller=Controller(settings(),backend,tmp_path/'run.jsonl',lambda _:next(observations))
+    result=controller.run()
+    assert result['status']=='blocked' and 'Final camera acquisition failed' in result['reason']
+    assert len(backend.moves)==2 and result['final_readback']==backend.moves[-1]
+    assert result['final_observation']['stage']=='search'
 
 
 def test_fit_failure_stops_without_motion(tmp_path):
@@ -180,6 +206,7 @@ def test_search_and_intersection_use_bounded_targets(tmp_path):
     np.testing.assert_allclose(b.moves,[[0,-4],[10,0]],atol=1e-12)
     np.testing.assert_allclose(r['intersection']['position'],[80,0],atol=1e-12)
     np.testing.assert_allclose(r['final_readback'],[10,0],atol=1e-12)
+    assert r['final_observation']['position']==r['final_readback']
 
 
 @pytest.mark.parametrize('target', [[float('nan'),0],[0,float('inf')],[0]])
@@ -213,12 +240,16 @@ def test_mapping_all_quadrants():
     np.testing.assert_allclose(motor_direction([-3,-4]),[-.6,.8])
 
 
-def test_replay_does_not_snap_and_final_move_needs_no_image():
-    replay=Replay({'units':'um','samples':[{'position':[0,0],'image':'recorded.tiff'}]},[0,0])
-    assert replay.acquire_image()=='recorded.tiff'
-    replay.move_absolute([.1,.2])
+def test_replay_does_not_snap_and_final_move_needs_no_image(tmp_path):
+    replay=Replay({'units':'um','samples':[{'position':[0,0],'image':'first.tiff'},
+                                          {'position':[5,0],'image':'second.tiff'}]},[0,0])
+    observations=iter([observation((0,-1)),observation((1,-1))])
+    controller=Controller(settings(),replay,tmp_path/'run.jsonl',lambda _:next(observations))
+    result=controller.run()
+    assert result['status']=='aligned' and result['acquisitions']==2
+    assert result['final_observation']['stage']=='search'
     with pytest.raises(ValueError,match='exact'):replay.acquire_image()
-    np.testing.assert_allclose(replay.read_position(),[.1,.2])
+    np.testing.assert_allclose(replay.read_position(),[0,-5],atol=1e-12)
 
 
 def test_log_records_moves_and_line_equations(tmp_path):
