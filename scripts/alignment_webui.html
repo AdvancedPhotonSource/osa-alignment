@@ -13,12 +13,15 @@ h1 { font-size: 26px; margin: 0; } h2 { font-size: 17px; margin: 0 0 14px; }
 p { line-height: 1.5; } .muted, figcaption { color: #526675; font-size: 13px; }
 .badge { background: #dcece7; color: #185a48; padding: 6px 12px; border-radius: 20px; }
 .summary, .charts, .details { display: grid; gap: 16px; margin-top: 16px; }
-.summary { grid-template-columns: repeat(4, 1fr); } .charts { grid-template-columns: repeat(3, 1fr); }
+.summary { grid-template-columns: repeat(4, 1fr); } .charts { grid-template-columns: 1fr 1fr; align-items: start; }
 .details { grid-template-columns: 1fr 1fr; align-items: start; }
 .card { background: white; border: 1px solid #d9e3e9; border-radius: 12px; padding: 18px; min-width: 0; }
 .value { font-size: 23px; font-weight: 600; margin-top: 6px; overflow-wrap: anywhere; }
 svg { width: 100%; display: block; } svg text { font: 11px system-ui, sans-serif; fill: #526675; }
-figure { margin: 0; } #image { display: block; max-width: 100%; max-height: 480px; margin: auto; }
+.charts svg { touch-action: none; user-select: none; cursor: grab; }
+.plot-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#plot-cursor { position: fixed; z-index: 10; pointer-events: none; background: #172b3a; color: white; padding: 6px 9px; border-radius: 5px; font-size: 12px; white-space: nowrap; }
+figure { margin: 0; } #image { display: block; width: min(100%, 480px); height: auto; max-height: 480px; object-fit: contain; margin: auto; }
 #image[hidden] { display: none; }
 figcaption { margin-top: 12px; overflow-wrap: anywhere; }
 .image-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
@@ -35,24 +38,21 @@ th, td { padding: 8px; text-align: left; border-bottom: 1px solid #e8eef2; white
 </style>
 </head>
 <body>
-<header><div><h1>OSA alignment</h1><p class="muted">Read-only run monitor · Lower M1 and M2 are better</p></div><span id="connection" class="badge" role="status">Connecting…</span></header>
+<header><div><h1>OSA alignment</h1><p class="muted">Read-only run monitor · Directed brightness symmetry and line intersection</p></div><span id="connection" class="badge" role="status">Connecting…</span></header>
 <div class="summary">
 <div class="card"><div class="muted">Run status</div><div id="status" class="value">Waiting</div></div>
 <div class="card"><div class="muted">Acquisitions / budget</div><div id="count" class="value">—</div></div>
-<div class="card"><div class="muted">Latest M1</div><div id="m1" class="value">—</div></div>
-<div class="card"><div class="muted">Latest M2</div><div id="m2" class="value">—</div></div>
+<div class="card"><div class="muted">Valid axes / required</div><div id="accepted" class="value">—</div></div>
+<div class="card"><div class="muted">Latest mismatch difference</div><div id="difference" class="value">—</div></div>
 </div>
 <div class="charts">
-<section class="card"><h2>Search trajectory</h2><svg id="trajectory" viewBox="0 0 460 330" role="img" aria-label="Motor x and y acquisition trajectory"></svg><p class="muted">□ Start · ○ Latest · Color follows acquisition order. Hover over points for details.</p></section>
-<section class="card"><h2>M1 · Boundary geometry</h2><svg id="primary" viewBox="0 0 460 330" role="img" aria-label="M1 history and BO entry threshold"></svg><p class="muted">Dashed line: BO entry threshold. Nonfinite metrics appear as gaps.</p></section>
-<section class="card"><h2>M2 · Hole intensity and centroid offset</h2><svg id="secondary" viewBox="0 0 460 330" role="img" aria-label="M2 history"></svg><p class="muted">All finite observations, including rejected trials and confirmations.</p></section>
+<section class="card"><div class="image-heading"><h2 id="image-title">Latest acquired image</h2><button id="go-live" type="button" disabled>Go to live</button></div><figure><img id="image" alt="OSA crop with directed symmetry axis" hidden><figcaption><div id="image-filename"></div><div id="image-note">Waiting for an image</div></figcaption></figure></section>
+<section class="card"><h2>Symmetry lines and search trajectory</h2><svg id="trajectory" viewBox="0 0 460 330" role="img" aria-label="Valid symmetry lines, motor trajectory and fitted intersection"></svg><p class="muted">Colored lines: accepted axes · Orange points: rejected axes · □ Start · ○ Current motor position · + Intersection. Equal motor scales on both axes.</p></section>
 </div>
-<div class="details">
-<section class="card"><div class="image-heading"><h2 id="image-title">Latest acquired image</h2><button id="go-live" type="button" disabled>Go to live</button></div><figure><img id="image" alt="OSA detector image" hidden><figcaption><div id="image-filename"></div><div id="image-note">Waiting for an image</div></figcaption></figure></section>
-<section class="card"><h2>Run settings</h2><p id="mode" class="muted"></p><pre id="settings"></pre></section>
-</div>
+<div id="plot-cursor" hidden></div>
 <section class="card" style="margin-top:16px"><h2>Current activity</h2><div id="updated" class="muted"></div><p id="message"></p><p id="final" class="muted"></p></section>
-<section class="card" style="margin-top:16px"><h2>Observation history</h2><p class="muted">Click a step to view its image. Ellipse centers and semiaxes are in detector pixels. Angle is clockwise from image +x toward +y. Failed fits retain their candidate parameters when available.</p><div class="scroll"><table><thead><tr><th>#</th><th>Stage</th><th>Motor x</th><th>Motor y</th><th>M1</th><th>M2</th><th>Fit</th><th>Center (x, y), px</th><th>Inner (a, b), px</th><th>Outer (a, b), px</th><th>Angle (°)</th><th>Axes</th><th>BO eligibility</th></tr></thead><tbody id="history"></tbody></table></div></section>
+<section class="card" style="margin-top:16px"><h2>Acquisition history</h2><p class="muted">Click an acquisition to view its image. E is the reflection mismatch; Δ is |E⊥ − E| / max(E⊥, E). Image angles run clockwise from the right; motor coordinates use +y upward.</p><div class="scroll"><table><thead><tr><th>#</th><th>Decision</th><th>Motor x</th><th>Motor y</th><th>E</th><th>E⊥</th><th>Δ</th><th>Axis angle (°)</th><th>Intensity slope / px</th><th>Motor direction</th><th>Reason</th></tr></thead><tbody id="history"></tbody></table></div></section>
+<section class="card" style="margin-top:16px"><h2>Run settings</h2><p id="mode" class="muted"></p><pre id="settings"></pre></section>
 <script>
 const initialState = /* INITIAL_STATE */ null;
 let currentState = null, selectedAcquisition = null, selectedPreview = null, imageRequest = 0;
@@ -60,75 +60,158 @@ const byId = id => document.getElementById(id);
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const format = value => finite(value) ? Number(value.toPrecision(5)).toString() : (value ?? '—');
 const formatPair = values => Array.isArray(values) && values.length === 2 ? `(${values.map(format).join(', ')})` : '—';
+const plotStates = new Map();
+const plotArea = {left: 80, top: 22, width: 350, height: 255};
+function interactivePlot(svg) {
+  const state = {view: null, bounds: null, drag: null};
+  const {left, top, width, height} = plotArea;
+  const tooltip = byId('plot-cursor');
+  const controls = document.createElement('p');
+  controls.className = 'muted plot-controls';
+  controls.textContent = 'Drag to pan · Shift-drag to zoom';
+  const reset = document.createElement('button');
+  reset.type = 'button'; reset.textContent = 'Reset view';
+  reset.addEventListener('click', () => { state.view = null; state.redraw(); });
+  controls.append(reset); svg.after(controls);
+  const position = event => new DOMPoint(event.clientX, event.clientY).matrixTransform(svg.getScreenCTM().inverse());
+  const inside = p => p.x >= left && p.x <= left + width && p.y >= top && p.y <= top + height;
+  // SVG coordinates increase downward; motor/metric coordinates increase upward.
+  const coordinates = (p, bounds) => [bounds[0] + (p.x - left) / width * (bounds[1] - bounds[0]),
+    bounds[3] - (p.y - top) / height * (bounds[3] - bounds[2])];
+  function showCursor(event) {
+    const p = position(event);
+    tooltip.hidden = !state.bounds || !inside(p);
+    if (tooltip.hidden) return;
+    const [x, y] = coordinates(p, state.bounds);
+    tooltip.textContent = `x: ${format(x)} · y: ${format(y)} ${state.units ?? ''}`;
+    tooltip.style.left = `${Math.max(4, Math.min(event.clientX + 14, window.innerWidth - tooltip.offsetWidth - 4))}px`;
+    tooltip.style.top = `${Math.max(4, Math.min(event.clientY + 14, window.innerHeight - tooltip.offsetHeight - 4))}px`;
+  }
+  state.refreshCursor = () => { if (state.cursor) showCursor(state.cursor); };
+  svg.addEventListener('pointerdown', event => {
+    const p = position(event);
+    if (event.button !== 0 || state.drag || !state.bounds || !inside(p)) return;
+    event.preventDefault();
+    state.drag = {start: p, end: p, bounds: [...state.bounds], view: state.view,
+      zoom: event.shiftKey, pointerId: event.pointerId};
+    svg.setPointerCapture(event.pointerId);
+    svg.style.cursor = event.shiftKey ? 'crosshair' : 'grabbing';
+  });
+  svg.addEventListener('pointermove', event => {
+    state.cursor = event;
+    const drag = state.drag;
+    if (drag && event.pointerId === drag.pointerId) {
+      const p = position(event);
+      drag.end = {x: Math.max(left, Math.min(left + width, p.x)), y: Math.max(top, Math.min(top + height, p.y))};
+      if (!drag.zoom) {
+        const [x0, y0] = coordinates(drag.start, drag.bounds), [x1, y1] = coordinates(drag.end, drag.bounds);
+        state.view = [drag.bounds[0] + x0 - x1, drag.bounds[1] + x0 - x1,
+          drag.bounds[2] + y0 - y1, drag.bounds[3] + y0 - y1];
+      }
+      state.redraw();
+    }
+    showCursor(event);
+  });
+  function finish(event) {
+    const drag = state.drag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (event.type !== 'pointerup') state.view = drag.view;
+    else if (drag.zoom && Math.abs(drag.end.x - drag.start.x) >= 4 && Math.abs(drag.end.y - drag.start.y) >= 4) {
+      const [x0, y0] = coordinates(drag.start, drag.bounds), [x1, y1] = coordinates(drag.end, drag.bounds);
+      state.view = [Math.min(x0, x1), Math.max(x0, x1), Math.min(y0, y1), Math.max(y0, y1)];
+      if (svg.id === 'trajectory') {
+        // Expand the selected bounds to retain equal motor units per screen pixel.
+        const scale = Math.max((state.view[1] - state.view[0]) / width, (state.view[3] - state.view[2]) / height);
+        const xc = (x0 + x1) / 2, yc = (y0 + y1) / 2;
+        state.view = [xc - scale * width / 2, xc + scale * width / 2, yc - scale * height / 2, yc + scale * height / 2];
+      }
+    }
+    state.drag = null;
+    if (svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
+    svg.style.cursor = '';
+    state.redraw();
+    if (event.type === 'pointerup') showCursor(event);
+  }
+  for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) svg.addEventListener(type, finish);
+  svg.addEventListener('pointerleave', () => { state.cursor = null; tooltip.hidden = true; });
+  return state;
+}
 function node(tag, attrs = {}, text = null) {
   const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
   for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
   if (text !== null) el.textContent = text;
   return el;
 }
-function plot(id, rows, metric, settings) {
-  const svg = byId(id); svg.replaceChildren();
-  const trajectory = metric === null;
-  const points = rows.map(o => ({x: trajectory ? o.position[0] : o.acquisition,
-    y: trajectory ? o.position[1] : o.metrics[metric], o}));
-  const valid = points.filter(p => finite(p.x) && finite(p.y));
-  if (!valid.length) { svg.append(node('text', {x: 230, y: 160, 'text-anchor': 'middle'}, 'Waiting for finite observations')); return; }
-  const threshold = metric === 'primary_metric' ? settings.stage_2_entrance_m1 : null;
-  let xs = valid.map(p => p.x), ys = valid.map(p => p.y);
-  if (!trajectory) xs = points.map(p => p.x);
-  if (finite(threshold)) ys.push(threshold);
-  function range(values) {
-    const lo = Math.min(...values), hi = Math.max(...values);
-    const pad = (hi - lo || Math.abs(lo) * .1 || 1) * .15;
-    return [lo - pad, hi + pad];
-  }
-  let [xmin, xmax] = range(xs), [ymin, ymax] = range(ys);
-  if (!trajectory) { xmin = 1; xmax = Math.max(2, rows.at(-1).acquisition); }
-  const left = 80, top = 22, width = 350, height = 255;
-  if (trajectory) {
-    const scale = Math.max((xmax - xmin) / width, (ymax - ymin) / height);
-    const xc = (xmin + xmax) / 2, yc = (ymin + ymax) / 2;
-    xmin = xc - scale * width / 2; xmax = xc + scale * width / 2;
-    ymin = yc - scale * height / 2; ymax = yc + scale * height / 2;
-  }
+function plot(stateData) {
+  const svg = byId('trajectory'); svg.replaceChildren();
+  if (!plotStates.has(svg.id)) plotStates.set(svg.id, interactivePlot(svg));
+  const state = plotStates.get(svg.id), rows = stateData.observations, settings = stateData.settings;
+  state.redraw = () => plot(stateData);
+  state.units = settings.units;
+  const {left, top, width, height} = plotArea;
+  const trajectory = rows.length ? [rows[0].position, ...stateData.moves.map(m => m.position)] : [];
+  const points = [...rows.map(o => o.position), ...trajectory];
+  if (stateData.intersection) points.push(stateData.intersection.position);
+  if (settings.bounds) points.push([settings.bounds[0][0], settings.bounds[1][0]], [settings.bounds[0][1], settings.bounds[1][1]]);
+  if (!points.length) { state.bounds = null; state.refreshCursor(); return; }
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const xc = (Math.min(...xs) + Math.max(...xs)) / 2, yc = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const scale = Math.max((Math.max(...xs) - Math.min(...xs) + 2) / width, (Math.max(...ys) - Math.min(...ys) + 2) / height);
+  let bounds = [xc - scale*width/2, xc + scale*width/2, yc - scale*height/2, yc + scale*height/2];
+  if (state.view || state.drag) bounds = state.view ?? state.drag.bounds;
+  state.bounds = bounds;
+  const [xmin, xmax, ymin, ymax] = bounds;
   const x = v => left + (v - xmin) / (xmax - xmin) * width;
   const y = v => top + height - (v - ymin) / (ymax - ymin) * height;
-  const ticks = trajectory ? 4 : Math.min(4, xmax - xmin);
-  for (let i = 0; i <= ticks; i++) {
-    const xv = trajectory ? xmin + (xmax - xmin) * i / ticks : Math.round(xmin + (xmax - xmin) * i / ticks);
-    const yv = ymin + (ymax - ymin) * i / ticks;
-    svg.append(node('line', {x1: x(xv), x2: x(xv), y1: top, y2: top + height, stroke: '#e5edf2'}),
-      node('line', {x1: left, x2: left + width, y1: y(yv), y2: y(yv), stroke: '#e5edf2'}),
-      node('text', {x: x(xv), y: top + height + 20, 'text-anchor': 'middle'}, Number(xv.toPrecision(3))),
-      node('text', {x: left - 8, y: y(yv) + 4, 'text-anchor': 'end'}, Number(yv.toPrecision(4))));
+  for (let i = 0; i <= 4; i++) {
+    const xv = xmin + (xmax - xmin)*i/4, yv = ymin + (ymax - ymin)*i/4;
+    svg.append(node('line', {x1:x(xv), x2:x(xv), y1:top, y2:top+height, stroke:'#e5edf2'}),
+      node('line', {x1:left, x2:left+width, y1:y(yv), y2:y(yv), stroke:'#e5edf2'}),
+      node('text', {x:x(xv), y:top+height+19, 'text-anchor':'middle'}, format(xv)),
+      node('text', {x:left-8, y:y(yv)+4, 'text-anchor':'end'}, format(yv)));
   }
-  svg.append(node('text', {x: left + width / 2, y: 324, 'text-anchor': 'middle'}, trajectory ? `x (${settings.units})` : 'Acquisition'),
-    node('text', {transform: 'translate(15 150) rotate(-90)', 'text-anchor': 'middle'}, trajectory ? `y (${settings.units})` : metric === 'primary_metric' ? 'M1' : 'M2'));
-  if (finite(threshold)) svg.append(node('line', {x1: left, x2: left + width, y1: y(threshold), y2: y(threshold), stroke: '#ce4e40', 'stroke-dasharray': '6 4'}));
-  let path = '', connected = false;
-  for (const p of points) {
-    if (!finite(p.y)) { connected = false; continue; }
-    path += `${connected ? 'L' : 'M'}${x(p.x)},${y(p.y)} `; connected = true;
+  svg.append(node('text', {x:left+width/2, y:324, 'text-anchor':'middle'}, `x (${settings.units})`),
+    node('text', {transform:'translate(15 150) rotate(-90)', 'text-anchor':'middle'}, `y (${settings.units})`));
+  const clip = node('clipPath', {id:'trajectory-clip'});
+  clip.append(node('rect', {x:left,y:top,width,height}));
+  const data = node('g', {'clip-path':'url(#trajectory-clip)'});
+  svg.append(clip, data);
+  const color = o => `hsl(${270 - 220 * o.acquisition / Math.max(1,rows.length)} 65% 43%)`;
+  for (const o of rows.filter(o => o.line)) {
+    const p = o.line.point, v = o.line.direction;
+    // Project the view center onto the infinite line, then extend beyond the view diagonal.
+    const mid = [(xmin+xmax)/2, (ymin+ymax)/2];
+    const t = (mid[0]-p[0])*v[0] + (mid[1]-p[1])*v[1];
+    const span = Math.hypot(xmax-xmin, ymax-ymin);
+    const line = node('line', {x1:x(p[0]+(t-span)*v[0]), y1:y(p[1]+(t-span)*v[1]),
+      x2:x(p[0]+(t+span)*v[0]), y2:y(p[1]+(t+span)*v[1]), stroke:color(o), 'stroke-width':1.5, opacity:0.8});
+    line.append(node('title', {}, `Axis #${o.acquisition}: ${formatPair(o.line.normal)} · (x,y) = ${format(o.line.constant)}`));
+    data.append(line);
   }
-  svg.append(node('path', {d: path, fill: 'none', stroke: trajectory ? '#a5b6bf' : '#247d9c', 'stroke-width': 1.6}));
-  for (const p of valid) {
-    const dot = node('circle', {cx: x(p.x), cy: y(p.y), r: 4,
-      fill: trajectory ? `hsl(${270 - 220 * p.o.acquisition / rows.at(-1).acquisition} 65% 43%)` : '#247d9c'});
-    dot.append(node('title', {}, `#${p.o.acquisition} · ${p.o.stage} · (${p.o.position.map(format).join(', ')})\nM1: ${format(p.o.metrics.primary_metric)} · M2: ${format(p.o.metrics.secondary_metric)}\n${p.o.bo_rejection_reason ?? 'BO eligible'}`));
-    svg.append(dot);
+  if (trajectory.length) data.append(node('path', {d:trajectory.map((p,i) => `${i?'L':'M'}${x(p[0])},${y(p[1])}`).join(' '),
+    fill:'none',stroke:'#172b3a','stroke-width':1.6,'stroke-dasharray':'4 3'}));
+  for (const o of rows) {
+    const dot = node('circle', {cx:x(o.position[0]), cy:y(o.position[1]), r:4,
+      fill:o.line ? color(o) : '#e68a20'});
+    dot.append(node('title', {}, `#${o.acquisition} · ${o.line?'Accepted':'Rejected/failed'} · ${formatPair(o.position)}`));
+    dot.addEventListener('click', () => selectImage(o));
+    data.append(dot, node('text', {x:x(o.position[0])+6,y:y(o.position[1])-7}, String(o.acquisition)));
   }
-  if (trajectory) {
-    const first = valid[0], last = valid.at(-1);
-    svg.append(node('rect', {x: x(first.x) - 7, y: y(first.y) - 7, width: 14, height: 14, fill: 'none', stroke: '#172b3a', 'stroke-width': 2}),
-      node('circle', {cx: x(last.x), cy: y(last.y), r: 8, fill: 'none', stroke: '#ce4e40', 'stroke-width': 2}));
-    const labels = new Map();
-    for (const p of valid) {
-      const key = JSON.stringify([p.x, p.y]);
-      if (!labels.has(key)) labels.set(key, {p, ids: []});
-      labels.get(key).ids.push(p.o.acquisition);
-    }
-    for (const {p, ids} of labels.values()) svg.append(node('text', {x: x(p.x) + 7, y: y(p.y) - 9}, ids.join(', ')));
+  if (trajectory.length) {
+    const first = trajectory[0], current = stateData.result?.final_readback ?? trajectory.at(-1);
+    data.append(node('rect', {x:x(first[0])-6,y:y(first[1])-6,width:12,height:12,fill:'none',stroke:'#172b3a','stroke-width':2}));
+    if (current) data.append(node('circle', {cx:x(current[0]),cy:y(current[1]),r:8,fill:'none',stroke:'#ce4e40','stroke-width':2}));
   }
+  if (stateData.intersection) {
+    const p = stateData.intersection.position;
+    data.append(node('path', {d:`M${x(p[0])-8},${y(p[1])}h16 M${x(p[0])},${y(p[1])-8}v16`,stroke:'#b31c50','stroke-width':3}));
+  }
+  if (state.drag?.zoom) {
+    const {start,end} = state.drag;
+    svg.append(node('rect', {x:Math.min(start.x,end.x),y:Math.min(start.y,end.y),width:Math.abs(end.x-start.x),height:Math.abs(end.y-start.y),
+      fill:'#247d9c','fill-opacity':.15,stroke:'#247d9c','stroke-dasharray':'4 3','pointer-events':'none'}));
+  }
+  state.refreshCursor();
 }
 function renderImage() {
   const state = currentState;
@@ -178,26 +261,23 @@ function render(state) {
   const rows = state.observations, latest = rows.at(-1), settings = state.settings;
   byId('status').textContent = state.result?.status ?? (latest?.stage ?? 'Starting');
   byId('count').textContent = `${state.result?.acquisitions ?? rows.length} / ${settings.max_acquisitions ?? '—'}`;
-  byId('m1').textContent = format(latest?.metrics.primary_metric);
-  byId('m2').textContent = format(latest?.metrics.secondary_metric);
+  byId('accepted').textContent = `${rows.filter(o => o.line).length} / ${settings.valid_axes_required ?? '—'}`;
+  byId('difference').textContent = finite(latest?.metrics.relative_mismatch_difference) ? `${format(100*latest.metrics.relative_mismatch_difference)}%` : '—';
   byId('mode').textContent = `${state.replay ? 'Recorded-image replay' : 'Adapter acquisition'} · Motor units: ${settings.units ?? '—'}`;
   byId('settings').textContent = Object.entries(settings).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
   byId('message').textContent = state.message;
   byId('updated').textContent = state.updated ? `Last event: ${new Date(state.updated).toLocaleString()}` : '';
   byId('final').textContent = state.result ? `Final readback: ${JSON.stringify(state.result.final_readback)} · ${state.result.reason}` : '';
-  plot('trajectory', rows, null, settings);
-  plot('primary', rows, 'primary_metric', settings);
-  plot('secondary', rows, 'secondary_metric', settings);
+  plot(state);
   byId('history').replaceChildren(...rows.slice().reverse().map(o => {
     const tr = document.createElement('tr');
     tr.dataset.acquisition = o.acquisition;
     tr.addEventListener('click', () => selectImage(o));
-    const fit = o.metrics.fit;
-    const fitStatus = fit ? (o.metrics.valid ? 'Valid' : 'Failed validation') : 'No fit';
-    const axesMode = typeof fit?.axes_fixed === 'boolean' ? (fit.axes_fixed ? 'Fixed' : 'Fitted') : '—';
-    for (const value of [o.acquisition, o.stage, ...o.position.map(format), format(o.metrics.primary_metric), format(o.metrics.secondary_metric),
-      fitStatus, fit ? formatPair([fit.center_x, fit.center_y]) : '—', formatPair(fit?.inner_axes), formatPair(fit?.outer_axes),
-      format(fit?.angle_degrees), axesMode, o.bo_eligible ? 'Eligible' : o.bo_rejection_reason]) {
+    const m = o.metrics;
+    const decision = m.error ? 'Failed' : m.valid ? 'Accepted' : 'Rejected';
+    for (const value of [o.acquisition, decision, ...o.position.map(format), format(m.reflection_mismatch), format(m.perpendicular_mismatch),
+      finite(m.relative_mismatch_difference) ? `${format(100*m.relative_mismatch_difference)}%` : '—',
+      format(m.fit?.angle_deg), format(m.profile_slope_intensity_per_px), formatPair(o.motor_direction), (m.reasons ?? []).join('; ')]) {
       const td = document.createElement('td'); td.textContent = value; tr.append(td);
     }
     const button = document.createElement('button');

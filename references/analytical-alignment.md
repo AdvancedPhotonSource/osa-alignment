@@ -1,486 +1,211 @@
-# Two-stage OSA alignment
+# Symmetry-guided OSA alignment
 
-The workflow uses `evaluate_alignment.py` for ellipse metrics and
-`align_osa.py` for quadratic M1 optimization followed by M2 Bayesian optimization.
-Run commands from the skill
-directory. Install the locked dependencies in the local environment first:
-
-```sh
-uv sync --project scripts --locked
-```
+The controller uses brightness-reflection axes to infer the alignment point in
+motor space. It starts at the actual readback, collects valid lines, and moves
+to their least-squares intersection. Image evaluation is owned by
+[`evaluate_alignment.py`](../scripts/evaluate_alignment.py), the symmetry fit by
+[`symmetry.py`](../scripts/symmetry.py), and motor search by
+[`align_osa.py`](../scripts/align_osa.py).
 
 ## Quantitative evaluation
 
-Use [scripts/evaluate_alignment.py](../scripts/evaluate_alignment.py) to measure
-concentric boundary geometry and central hole-to-annulus intensity contrast. Dependencies are
-managed by the local `uv` project in `scripts/`. From the skill directory:
+The evaluator crops exclusive detector bounds `[x0, y0, x1, y1]`. Image coordinates
+increase rightward and downward; fitted positions are relative to the crop.
+RGB input is converted to luminance with weights `[0.2126, 0.7152, 0.0722]`.
+Intensity values must be finite and nonnegative, with positive total signal.
 
-```sh
-uv sync --project scripts --locked
-uv run --project scripts --locked python scripts/evaluate_alignment.py IMAGE --output metrics.json
-uv run --project scripts --locked python scripts/evaluate_alignment.py IMAGE --inner-axes 38 34 --outer-axes 98 94 --output metrics.json
-```
+With an empty crop, the first acquisition sets the detector bounds for the run.
+The evaluator computes the center of mass of the full unsmoothed grayscale frame
+and tests squares of side 128, 256, 384, 512, … pixels around it. It selects the
+first enclosing at least 95% of the frame's integrated intensity, including
+background. Pixel rounding places the window center within half a pixel per axis.
+Windows extending beyond the detector use zero padding. Each observation records
+the resolved bounds in `metrics.crop_xyxy`.
 
-The script fits two ellipses sharing a center and orientation, with independently
-fitted semiaxes. Supply both `--inner-axes A B` and `--outer-axes A B` to hold the
-four semiaxes fixed and fit only the center and common orientation. Omit both
-options to fit the semiaxes as well. Fixed semiaxes keep the hole area comparable
-across an alignment sequence. The example dimensions are illustrative. These are
-semiaxis lengths in pixels, not diameters; corresponding inner semiaxes must be
-smaller than the outer ones. `angle_degrees` describes the A-axis clockwise from
-image +x toward image +y, modulo 180°. A and B need not be ordered by length.
-Use `--min-eccentricity E` (or `evaluator.min_eccentricity` in the controller
-configuration) to require both ellipses to satisfy \(c/a\ge E\), with
-\(c=\sqrt{a^2-b^2}\), \(a\) the larger semiaxis, and \(0\le E<1\). Omit it to
-fit without this bound. Fixed axes must already satisfy the bound.
-The fit uses ellipse normals to classify edges and integrates the elliptical
-hole. Nearly circular ellipses have poorly determined orientation. Extra shape
-freedom can absorb actual misalignment, so inspect fitted aspect ratios and the
-image as well as the residual.
+Gaussian smoothing (default sigma 1.5 pixels) precedes geometry fitting. The
+intensity-weighted centroid supplies the initial point through which candidate
+axes pass. Polar resampling covers the complete crop, extending values outside
+it by zero. The relevant signal should be contained in the crop.
 
-Set `--pre-blur-sigma` (or `evaluator.pre_blur_sigma` in the alignment config)
-to smooth the grayscale image before percentile normalization and geometry fitting.
-It is a nonnegative Gaussian standard deviation in pixels; 0 disables it.
-This precedes Canny's own `sigma` smoothing (default 2 pixels). All geometry
-initialization and edge fitting use the pre-blurred image; hole and annulus
-intensities are measured on the original image using the resulting fitted masks.
+For polar brightness P(r,φ), calculate the angular FFT F at every radius and
+inverse-transform `sum_r r * F(r)**2`. This is circular self-convolution, with
+radial area weighting. Its angular coordinate is twice the reflection-axis
+angle. Select up to three local maxima separated by at least 15° in axis angle.
+This operates on brightness patterns of any shape.
 
-Set `--hole-asymmetry-weight` (or `evaluator.hole_asymmetry_weight` in the
-alignment config) to weight the hole's intensity-centroid offset in M2. It is a
-nonnegative multiplier on the offset expressed in inner equal-area radii; the
-default is 0, disabling the term. Gaussian central weighting and annulus
-normalization are always active, with a fixed Gaussian width of 0.25 times each
-inner semiaxis. This emphasizes central leakage while reducing the bright rim's
-contribution.
+Each candidate undergoes bounded Powell refinement in angle (±10°) and normal
+displacement (±10 pixels). The objective is
 
-The script detects Canny edges, distinguishes inward and outward intensity
-transitions, and fits the concentric ellipses. Lower scores are better:
+\[
+E=\frac{\sum_p[J(p)-J(R(p))]^2}{\sum_p[J(p)^2+J(R(p))^2]},
+\]
 
-- `primary_metric` (M1): mean inner/outer circumference-to-edge RMS distance divided
-  by outer equal-area radius (√(AB) for an ellipse), plus a penalty for unsupported
-  angular coverage. Both boundaries receive equal weight, with 360 true polar-angle
-  samples per boundary and a default coverage weight λ = 0.5. This measures
-  geometry and completeness.
-- `secondary_metric` (M2): Gaussian-weighted hole mean divided by the annulus mean,
-  using original background-subtracted intensities. In fitted ellipse coordinates,
-  the hole weights are `exp(-rho_squared / (2 * 0.25**2))`, where
-  `rho_squared = (u / inner_a)**2 + (v / inner_b)**2 < 1`. The ratio is divided by
-  `--intensity-normalizer` (default 1), then multiplied by
-  `1 + hole_asymmetry_weight * hole_centroid_offset_fraction` (default weight 0).
-  Use `--background` for a known scalar detector background. M2 is dimensionless;
-  uniform multiplicative intensity changes cancel when background scales with
-  the signal and pixels are unclipped. RGB images use luminance weights.
-  `hole_weighted_mean` and `annulus_mean` expose the two means. The full-hole
-  integral, mean, and hole-to-annulus integral ratio remain available as diagnostics.
-  `hole_centroid_offset_px` and `hole_centroid_offset_fraction` report the
-  intensity-weighted centroid's distance from the inner center, in pixels and in
-  inner equal-area radii; both are recorded even when the fit is invalid.
-  Centroid weights are clipped at zero so an over-subtracted background cannot
-  diverge the centroid, and an empty hole reports a zero offset rather than an
-  undefined one. The optional centroid penalty uses full-hole intensities.
+where J is the smoothed image and R reflects about the trial line. The fixed
+Cartesian evaluation region contains the crop and its reflected support for all
+allowed trial lines. This keeps the compared signal constant as the line moves.
+Bilinear resampling approximates reflection; optimization uses a 2-pixel grid
+and candidate comparison uses a 1-pixel grid. Powell minimizes `1 + E` so its
+relative convergence tolerance remains meaningful near zero mismatch. Select
+the lowest-mismatch result; failure of that selected fit stops evaluation.
 
-M1 is always finite for an accepted image input, including failed optimizer
-convergence or fit validation. It uses residuals and unsupported angular coverage
-from the best available optimizer geometry. If no seed or boundary edge is found,
-a centered ellipse seed and finite image-diagonal distances for absent edges keep
-the optimization and score defined. The optimizer's returned parameters are used
-even when it reaches its evaluation limit. `valid` and `reasons` still report
-fit quality, and invalid fits retain infinite M2 (encoded as `"inf"` in JSON).
-A finite M1 does not imply a valid fit or successful alignment. Review the image,
-RMS errors, coverage, hole mean, and hole area alongside the scores.
+The perpendicular axis passes through the fitted axis point closest to the
+centroid. Evaluate its mismatch on the same fixed grid, with no independent
+position/angle optimization. The mono-axial acceptance measure is
 
-No motor response calibration, centroid direction, reference center, Jacobian,
-or eta is needed. Configure fitting for the current images in `evaluator`.
-The bundled [alignment settings](../scripts/alignment.json) configure the motor
-search and acquisition budget. Set both `evaluator.inner_axes` and
-`evaluator.outer_axes` to hold semiaxes fixed for the current instrument.
+\[
+\Delta = |E_\perp-E|/\max(E_\perp,E).
+\]
+
+Accept exactly when Δ exceeds `mismatch_relative_tolerance` (default 0.10).
+When both errors are zero, Δ is defined to be zero. The procedure uses this
+relative test as its acceptance criterion.
+
+## Axis direction
+
+Sample the raw grayscale crop along the whole in-crop segment of the fitted
+line, at spacing no larger than one pixel, using bilinear interpolation. Fit
+`intensity = slope * signed_distance + intercept` with ordinary least squares.
+Choose the sign of the axis vector so fitted intensity increases in that
+direction. The slope is measured in intensity units per pixel. A numerically
+zero slope leaves the direction undefined and stops the run.
+
+Image direction `(ux, uy)` maps to unit motor direction `(ux, -uy)`. In motor
+coordinates, the 3 o'clock direction is `(vy, -vx)` for directed axis `(vx, vy)`.
+Each accepted line passes through its acquisition readback `p_i`:
+
+\[
+ n_i^T p = b_i,\quad n_i=(-v_{iy},v_{ix}),\quad b_i=n_i^T p_i.
+\]
+
+The image-axis intercept only locates the overlay in detector pixels. It is not
+converted into a motor displacement.
+
+## Search and intersection
+
+Acquire one image at the starting readback. After an ambiguous-axis rejection,
+move `-reverse_step_um * v`. After acceptance, store the line and, if more lines
+are required, move `lateral_step_um * (vy, -vx)`. Reacquire after each search move.
+As soon as the required line count is reached, solve
+
+\[
+ p_* = \arg\min_p\sum_i(n_i^T p-b_i)^2
+\]
+
+and move directly to `p_*`. Unit normals make the residuals perpendicular
+motor-space distances in micrometers. All accepted lines receive equal weight.
+The solver centers motor coordinates for numerical conditioning and reports
+rank, condition number, residuals, and RMS distance. Rank below two stops the
+run because the intersection is not unique. Motor bounds apply to the complete
+intersection target as well as each search target; targets are never clipped.
+
+The controller reads position before and after every acquisition and move.
+Actual readbacks anchor the stored lines. The final search acquisition and the
+final motor readback are separate result fields. Completion consists of the
+intersection move and readback verification.
 
 ## Alignment settings
 
-Supply a JSON configuration; unknown keys are rejected. This example illustrates
-motor units and limits that must be replaced with appropriate local values:
-
-```json
-{
-  "units": "um",
-  "bounds": [[-15, 15], [-15, 15]],
-  "max_step": 5,
-  "min_step": 0.5,
-  "stage_2_entrance_m1": 0.02,
-  "stage_1_max_acquisitions": 20,
-  "max_acquisitions": 40,
-  "confirmations": 2,
-  "stage_2_bo_halfwidth": [5, 5],
-  "bo_initial_samples": 5,
-  "bo_initialization": "grid",
-  "stage_1_optimizer": "quadratic",
-  "stage_1_grid_spacing": 1.0,
-  "stage_2_grid_spacing": 0.1,
-  "gp_length_scale": [2.5, 2.5],
-  "gp_length_scale_bounds": [0.5, 10],
-  "gp_noise": 0.05
-}
-```
-
-| Field | Default | Meaning |
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `units`, `bounds`, `max_step` | required | Adapter units, `[x_min,x_max]` and `[y_min,y_max]`, maximum Euclidean displacement for moves after random initialization, including final transit |
-| `min_step` | 0.5 | Smallest trial displacement/spacing after random initialization, in motor units; 0 disables minimum spacing while still excluding repeated positions |
-| `evaluator` | `{}` | Current-run evaluator options; omit semiaxes to fit them per image, or supply both to fix them |
-| `stage_2_entrance_m1` | 0.02 | Finite threshold on the minimum M1 posterior mean for Stage 2 entry; a very negative value delays entry until the Stage 1 budget, with a separate positive `stage_2_eligibility_m1` |
-| `stage_2_eligibility_m1` | null | Observed M1 threshold for M2 training, final selection, and neighborhood exclusions; null uses `stage_2_entrance_m1` |
-| `stage_1_max_acquisitions` | 20 | Stage 1 acquisition budget, including baseline; grid mode requires at least 17 images and reserves a full Stage 2 grid plus confirmations |
-| `max_acquisitions` | 40 | Total budget including baseline and final confirmation images; transit moves take no images |
-| `confirmations` | 2 | Number of final reimages; at least two |
-| `readback_tolerance` | 0.001 | Maximum Euclidean readback discrepancy and per-axis allowance outside global bounds, in motor units; commanded targets remain within exact bounds |
-| `stage_2_bo_halfwidth` | [5, 5] | Half-widths of the motor search box, anchored during initialization and then centered on the M2 GP posterior-mean minimum |
-| `bo_initial_samples` | 5 | Stage 1 initial measurements including baseline (must fit its budget), and Stage 2 eligible initialization measurements including entry before EI; 0 starts EI when a training observation exists |
-| `bo_initialization` | `grid` | `random` uses `bo_initial_samples` and requires `stage_1_optimizer: "bo"`; `grid` measures a regular 4×4 initialization grid in each stage, plus baseline and Stage 2 entry |
-| `stage_1_optimizer` | `quadratic` | `bo` uses the M1 GP and EI; `quadratic` requires grid initialization, refits a full M1 quadratic after each image, and measures its bounded minimum until the Stage 1 budget |
-| `gp_length_scale` | [2.5, 2.5] | Initial Matérn-5/2 length scales and fallback before three distinct eligible locations, in motor units |
-| `gp_length_scale_bounds` | [0.5, 10] | Positive finite lower/upper bounds shared by both fitted spatial scales, in motor units |
-| `gp_noise` | 0.05 | Observation standard deviation in standardized GP target units; squared for GP alpha |
-| `gp_position_source` | `"requested"` | Coordinates for M1/M2 GP training: `"requested"` uses commanded targets, assuming those are the acquisition locations; `"readback"` uses measured positions |
-| `stage_2_gp_stage_1_noise_multiplier` | 3 | Multiplier on M2 GP noise for baseline and Stage 1 observations; finite and at least 1; default gives nine times the variance |
-| `stage_1_grid_spacing` | 1.0 | Candidate grid spacing along both axes over the global bounds, in motor units (µm for `units: "um"`) |
-| `stage_2_grid_spacing` | 0.1 | Candidate grid spacing along both axes within the current clipped local box, in motor units |
-| `bo_candidates` | null | Legacy field accepted when loading older configs; candidate counts are determined by the grid spacings |
-| `ei_xi` | 0 | EI improvement margin in the current objective's units (M1 or M2) |
-| `stage_2_min_ei` | 0 | Stop if maximum EI is at most this value, in M2 units |
-| `stage_2_target_m2` | null | Optional absolute target for the dimensionless, centrally weighted hole-to-annulus ratio; recalibrate thresholds from integrated-intensity runs and account for any enabled centroid penalty |
-| `seed` | 0 | Random seed for reproducible initialization selections |
+| `units` | required: `"um"` | Motor coordinates and distances in micrometers |
+| `bounds` | required | Absolute `[x_min,x_max]`, `[y_min,y_max]` |
+| `valid_axes_required` | 6 | Number of accepted lines before solving; at least 2 |
+| `reverse_step_um` | 5 | Reverse-axis displacement after rejection |
+| `lateral_step_um` | 5 | Clockwise perpendicular displacement after acceptance |
+| `max_acquisitions` | 20 | Total acquisition limit, including the starting image; at least the required line count |
+| `readback_tolerance` | 0.001 | Euclidean target/readback and acquisition-drift tolerance in µm; also permits this per-axis margin when reading global bounds |
+| `evaluator.crop_xyxy` | `[276,73,616,413]` | Integer exclusive detector bounds, or `[]` / `null` for automatic cropping |
+| `evaluator.mismatch_relative_tolerance` | 0.10 | Reject Δ at or below this fraction |
+| `evaluator.sigma` | 1.5 | Gaussian sigma in pixels for reflection fitting; 0 disables smoothing |
+| `evaluator.angle_samples` | 720 | Samples over the polar angle range 0–360°; corresponding axis angles span 0–180° |
+| `evaluator.angle_bound_deg` | 10 | Local angle half-width |
+| `evaluator.offset_bound_px` | 10 | Local normal-displacement half-width |
+| `evaluator.max_candidates` | 3 | Maximum separated angular peaks to refine |
+| `evaluator.evaluation_step` | 2 | Cartesian grid stride during optimization; final scores use stride 1 |
 
-Set bounds and `max_step` for the current instrument. All settings are recorded at
-the beginning of the trajectory. Thresholds are prototype settings to qualify
-with repeated measurements at the local instrument; they are not universal.
+The bundled configuration retains the instrument's existing readback tolerance
+of 10 µm; set this to the tolerance appropriate for the actual motor readbacks.
+The bundled bounds are `[-30,30]` on both axes. Settings are recorded in the log.
 
-### Stage 1: global M1 optimization
+## Adapter interface and APS 2-ID-D QueueServer adapter
 
-With `stage_1_optimizer: "bo"`, minimize M1 using a Matérn-5/2 Gaussian process and expected improvement over the
-full configured `bounds`. `stage_2_bo_halfwidth` and Stage 2 M1 neighborhood exclusions
-do not restrict this domain. All finite M1 observations train this GP, including
-failed fits and scores above the entry threshold. Use `gp_noise` to tolerate
-uncertain scores. With `bo_initialization: "random"`, the first `bo_initial_samples` measurements, counting the
-baseline, initialize the search randomly; 0 starts EI after the baseline.
-Random initialization ignores `min_step`/`max_step` and moves directly to each
-sampled target, avoiding duplicate positions and staying within global bounds.
+A backend provides `units = "um"`, `read_position()` returning `[x,y]`,
+`move_absolute([x,y])` that waits for completion, and `acquire_image()` returning
+a locally accessible image path. `--adapter MODULE:FACTORY` loads a factory
+accepting the JSON from `--adapter-config`.
 
-With `bo_initialization: "grid"`, measure all 16 points of a regular 4×4 grid
-spanning the global bounds after the baseline. Coordinates include both endpoints
-of each axis and are visited in x-major order. Stage 2 measures its model-minimum
-entry point, then a 4×4 grid spanning the clipped entry box. Both grids are completed
-regardless of observed M1; M2 eligibility remains active for training and selection.
-Grid initialization bypasses M1 neighborhood exclusions and step limits. Subsequent
-BO applies the usual exclusions and adapts the box. `bo_initial_samples` is ignored
-in this mode. Require `stage_1_max_acquisitions >= 17` and
-`max_acquisitions >= stage_1_max_acquisitions + 17 + confirmations`. Recorded
-backends must contain every grid location. The grids are measured even when a
-location coincides with an earlier baseline, entry, or Stage 1 observation.
-
-In BO mode, complete all initial measurements before checking entry. Then minimize the M1 GP
-posterior mean over the global bounds after every acquisition. Enter Stage 2 when
-that minimum is at or below `stage_2_entrance_m1` or `stage_1_max_acquisitions` is
-exhausted. Measure the posterior minimum as the first Stage 2 point in either case.
-The numerical search uses a 17-by-17 grid and measured positions to seed five local
-optimizations; discrete replay minimizes over recorded positions. Entry checks log
-the predicted M1 and position. Stage 1 does not terminate on `stage_2_min_ei`; when no
-distinct candidate remains it reimages the best M1 until a transition condition
-is met. Its acquisition budget is part of `max_acquisitions`, which also reserves
-`confirmations` final images and at least one Stage 2 acquisition.
-
-With the default `stage_1_optimizer: "quadratic"`, use grid initialization and fit
-`M1 = a + b*u + c*v + d*u² + e*u*v + f*v²` by ordinary least squares to all finite
-Stage 1 M1 measurements, including the baseline and repeated locations. Coordinates
-`u` and `v` map the global bounds to `[-1, 1]` for conditioning. Measure the global
-minimum over the bounded rectangle and refit with the new observation. The bounded
-minimum is selected from corners, edge minima, and the interior stationary point;
-concave or indefinite fits can therefore select an edge or corner. Continuous targets
-can revisit earlier positions. After the last Stage 1 acquisition, refit once more
-and acquire the Stage 2 entry image at that final minimum. This mode uses the full
-Stage 1 budget, with no early M1-threshold transition. A 20-image Stage 1 budget
-contains the baseline, 16 grid images, and three quadratic-minimum images.
-`quadratic_model` log events store normalized coefficients, training acquisition IDs,
-the minimum position, and predicted M1. Stage 2 retains its existing initialization,
-eligibility, GP noise, box adaptation, and BO rules.
-
-Candidate grids cover the global bounds in Stage 1 and the clipped local box in
-Stage 2. Both spacings must be finite and positive. Grids start at the lower bounds
-and include the upper bounds; the last interval can be shorter than the configured
-spacing. Evaluate EI at every surviving grid point. Random initialization chooses
-uniformly among surviving grid points. Recorded replay uses its available positions.
-The posterior-mean minimization used for entry and box centering retains its separate
-grid and local optimization. After random initialization,
-exclude measured positions within `min_step`. Subsequent BO targets farther
-than `max_step` use successive bounded transit moves without images. After
-initialization, exact-grid replay uses recorded locations connected by bounded
-moves; intermediate recorded waypoints need no acquisition. Motor readbacks are
-verified at every move and before/after acquisitions. Faults stop the run.
-
-### Stage 2: local M2 optimization
-
-Minimize M2 in a local box. During random initialization, keep the box centered
-on the global M1 posterior-mean minimum used for the entry measurement. The entry
-measurement counts toward initialization if eligible, followed by random measurements
-at distinct motor locations. After collecting `bo_initial_samples` eligible initialization measurements,
-recenter the box on a numerical minimum of the M2 GP posterior mean each iteration. Rejected
-attempts consume the total budget. Stage 1 observations can train the
-M2 GP but do not count toward Stage 2 random initialization. An explicit M2 target
-can end Stage 2 early, subject to final confirmation.
-
-On budget entry without an eligible M2 observation, anchor the initialization
-box at the global M1 posterior-mean minimum and sample randomly until initialization is complete
-and an eligible M2 is available. Apply the same Stage 2 exclusions throughout.
-If the exclusions or travel limits leave
-no candidates, report that reason and return to the lowest M1 observation for
-final confirmation; infeasible geometry remains unconfirmed.
-
-Find the posterior-mean minimum within the current box, clipped to global bounds
-and subject to M1 neighborhood exclusions. A 17-by-17 grid, the current center,
-and measured positions seed five constrained local optimizations. The center can
-lie between measurements; updating it takes no motor move or image. A flat
-posterior retains the center when it remains allowed. Each `search_box` event
-records the center and whether it is anchored for initialization or follows the
-posterior mean.
-
-One Matérn-5/2 GP models M2. All valid observations with finite M1 at or below
-the threshold and finite M2 enter its training set, including worse M2 values
-and repeated confirmations. The acquisition function is expected improvement
-`EI(M2)` relative to the lowest eligible observed M2. Targets are standardized,
-and each observation receives a diagonal noise variance in standardized units.
-For `baseline`, `stage1`, and `stage1_init` observations, the M2 GP variance is
-`(gp_noise * stage_2_gp_stage_1_noise_multiplier)**2`; other stages use `gp_noise**2`.
-The default multiplier of 3 reduces Stage 1 measurements' influence with nine
-times the variance. Set it to 1 for equal observation noise. After three
-distinct eligible locations, fit anisotropic length scales by maximizing marginal
-likelihood within `gp_length_scale_bounds`; before then, use `gp_length_scale`
-as a configured fallback. Each iteration rebuilds the GP from eligible history
-and logs its scales, whether they were fitted, and training acquisition IDs.
-
-GPs train on each observation's requested target by default. Set
-`"gp_position_source": "readback"` to use measured coordinates for both GP objectives. Recorded `position`
-values, motion checks, candidate spacing and exclusions, and the Stage 1 quadratic
-fit continue to use readbacks. The run's start event records the coordinate setting.
-
-Invalid fits and nonfinite or above-threshold M1 create spatial exclusions.
-For each rejected position `q`, exclude candidates `p` satisfying
-`((p_x-q_x)/ell_x)^2 + ((p_y-q_y)/ell_y)^2 <= 1`.
-This ellipse uses the latest GP scales, so its size changes on subsequent fits;
-before the M2 GP can be fitted, it uses the configured fallback scales. Retain all
-rejection locations, including Stage 1 observations, in the trajectory. Each
-observation records eligibility and a rejection reason, and each model event
-lists the acquisitions defining exclusions. Nonfinite M2 alone excludes an
-observation from training without creating an M1 neighborhood exclusion.
-
-Initialization and EI sampling both stay within global `bounds`, the local box
-with half-widths `stage_2_bo_halfwidth`, and the M1 neighborhood exclusions above. Random
-initialization ignores `min_step`/`max_step`, moves directly to each sampled
-target, and avoids exact duplicate measurements. Global bounds, readback
-verification, the local box, and M1 exclusions still apply. For subsequent EI sampling, filter displacements from the actual
-readback to `[min_step, max_step]` and exclude points within half `min_step` of
-any previously measured position. The local box follows the posterior-mean minimum after initialization.
-Continuous candidates are uniform random proposals within the box; exact-grid
-replay uses available recorded locations. A depleted filtered candidate pool
-ends the search with an explicit reason, including incomplete initialization
-when applicable. A finite random pool can miss a small remaining sampleable area.
-
-Keep the physical position at each trial, even when M2 is worse or M1 fails.
-Track the best eligible observation separately. Reserve `confirmations` images
-from the total budget for final verification. If the initialization budget runs
-out first, report that reason and confirm the best eligible observation found.
-At termination, return to that best position using bounded transit moves without
-acquisitions, then acquire the final confirmations. Exact-grid replay follows
-recorded waypoints connected by bounded moves for this return. A difficult landscape or large exclusions
-can still limit this local search.
-
-## Offline replay
-
-```sh
-uv run --project scripts --locked python scripts/align_osa.py \
-  --config scripts/alignment.json \
-  --manifest recorded-images.json --start 10 -10 \
-  --log replay-trajectory.jsonl --output replay-result.json
-```
-
-A replay manifest uses explicit motor units and absolute readback coordinates;
-image paths resolve relative to the manifest:
-
-```json
-{
-  "units": "um",
-  "samples": [
-    {"position": [0, 0], "image": "images/reference.tiff"},
-    {"position": [3, 0], "image": "images/displaced.tiff"}
-  ]
-}
-```
-
-Replay chooses exactly recorded positions and evaluates their recorded images.
-It has no interpolation. Select `min_step`, `max_step`, and BO widths appropriate
-to the recording grid. Repeated images at a position cycle in manifest order;
-reusing an image is not an independent confirmation or a fresh noise sample.
-The result explicitly identifies replay. Replay is a development check; it does not establish convergence on an instrument.
-
-## Live dashboard
-
-Append `--webui` to either an adapter or replay command:
-
-```sh
-uv run --project scripts --locked python scripts/align_osa.py \
-  --config scripts/alignment.json \
-  --adapter beamline_adapter:create_adapter --adapter-config beamline.json \
-  --log trajectory.jsonl --output result.json --webui --webui-port 8765
-```
-
-Open the printed URL, normally `http://127.0.0.1:8765/`, while alignment runs.
-The dashboard shows settings, the latest acquired image,
-acquisition positions, M1 with its BO entry threshold, M2, and observation history
-with stages, eligibility, fit validity, fitted center, inner/outer semiaxes, angle,
-and whether semiaxes were fixed or fitted. Centers and semiaxes use detector
-pixels; motor positions use the configured motor units. Failed fits show their
-retained candidate parameters, and unavailable parameters appear as dashes. Trajectory axes use equal motor-unit scales.
-Nonfinite metrics leave gaps in the charts and remain explicit in the table.
-Detector previews use per-image linear min/max scaling; metric calculations
-retain the original intensity units. The trajectory's latest marker denotes the
-latest acquisition; the completed run reports its final motor readback separately.
-
-The server reads the trajectory and saved images and refreshes once per second.
-It exposes read-only endpoints, binds to `127.0.0.1`, and uses the existing Python
-dependencies with no external browser libraries. Omit `--webui` to run without
-the server. Use `--webui-port 0` for an automatically selected port.
-
-For agent-launched runs, enable the flag, leave the command running, and give the
-user the printed URL. If possible, open the URL in a browser.
-For an agent on a remote host, forward the selected port:
-`ssh -L 8765:127.0.0.1:8765 USER@HOST`, then open `http://127.0.0.1:8765/` locally.
-The script does not launch a browser or wait for user interaction.
-
-The server closes when the command exits, including blocked alignment outcomes.
-A self-contained snapshot is saved using the log filename with an `.html` suffix
-(for example, `trajectory.html`), preserving any existing file at that path.
-Open this snapshot for final results after the server closes; an already-open live
-page may show its last received state if the run finishes between refreshes.
-
-## Beamline adapter placeholder
-
-Live use requires a facility adapter, such as the APS 2-ID-D implementation below.
-Create an importable module whose factory receives the adapter configuration and
-returns an object with this contract:
-
-```python
-class BeamlineAdapter:
-    units = "um"
-
-    def read_position(self):
-        """Return actual [x, y] motor readbacks."""
-        raise NotImplementedError
-
-    def move_absolute(self, position):
-        """Command OSA x/y; return only after completion and settling; raise on faults."""
-        raise NotImplementedError
-
-    def acquire_image(self):
-        """Acquire a fresh image under consistent settings and return its saved path."""
-        raise NotImplementedError
-
-
-def create_adapter(config):
-    return BeamlineAdapter()
-```
-
-Launch with `--adapter beamline_adapter:create_adapter --adapter-config beamline.json`
-in place of `--manifest` and `--start`. The controller reads its actual starting
-position and verifies readbacks before and after each acquisition. The adapter
-owns acquisition settings, freshness, motion settling, hardware interlocks, and
-finite motion/acquisition timeouts. 
-
-### APS 2-ID-D QueueServer adapter
-
-[`APS2IDDAdapter`](../scripts/aps2idd_adapter.py) implements this interface using
-the 2-ID-D QueueServer and its existing `acquire_xeye_image` function. Positions
-are absolute motor readbacks in micrometers; the adapter converts to/from the
-motors' millimeters. Image files must be available at the same absolute path on
-the worker and the machine running alignment.
-
-On the QueueServer host, put [`aps2idd_qserver.py`](../scripts/aps2idd_qserver.py)
-on the worker's Python import path and add these imports to its startup namespace:
+[`APS2IDDAdapter`](../scripts/aps2idd_adapter.py) uses the existing QueueServer
+helpers and converts between its micrometer interface and millimeter motor
+coordinates. Load these helpers in the worker startup namespace after beamline
+startup initializes the devices:
 
 ```python
 from aps2idd_qserver import read_osa_position, move_osa_absolute
 from s2idd_uprobe.qserver.xeye_osa import acquire_xeye_image
 ```
 
-Load the helpers after beamline startup initializes the `osa` and `savedata`
-devices. Allow `move_osa_absolute` in the user's QueueServer plan permissions and
-`read_osa_position` / `acquire_xeye_image` in function permissions, then reload the
-worker environment and its allowed lists using the beamline's normal procedure.
-The move plan validates both motor targets, waits with a finite motor timeout,
-and settles before completing. Existing motor limits and beamline interlocks
-remain responsible for hardware protection.
-
-Install the optional client dependency and edit
-[`aps2idd.adapter.json`](../scripts/aps2idd.adapter.json):
-
-```sh
-uv sync --project scripts --locked --group beamline
-```
-
-Replace `url` with the actual HTTP gateway URL (`http://HOST:PORT`) or direct
-QueueServer control address (`tcp://HOST:PORT`). The placeholder fails validation
-before any connection. `user` and `user_group` apply to direct QueueServer requests;
-HTTP uses the gateway's authenticated identity. For HTTP API-key authentication,
-set `api_key_env` to the name of an environment variable containing the key.
-
-`request_timeout` bounds individual requests, `motion_timeout` bounds motor
-statuses, and `acquisition_timeout` is passed to the camera helper.
-`operation_timeout` sets the polling deadline and must exceed motion plus settling
-and the acquisition timeout; in-flight requests have separate request timeouts.
-`settle_time` and `poll_interval` are in seconds, as are all timeouts.
-`post_call_sleep` is an optional dwell in seconds applied after every successful
-adapter call (read, move, and acquisition); it defaults to `0.0`, which disables it.
+Allow the move plan and read/acquisition functions in QueueServer permissions.
+Use the configured beamline client environment, an idle worker, and image paths
+shared between the worker and controller hosts. The adapter configuration is
+[`aps2idd.adapter.json`](../scripts/aps2idd.adapter.json). `post_call_sleep` sets a
+dwell after successful adapter calls; the camera helper receives
+`acquisition_timeout`. The camera exposure/gain should remain fixed during a run.
 
 ```sh
 uv run --project scripts --locked --group beamline python scripts/align_osa.py \
   --config scripts/alignment.json \
   --adapter aps2idd_adapter:create_adapter --adapter-config scripts/aps2idd.adapter.json \
-  --log trajectory.jsonl --output result.json
+  --log trajectory.jsonl --output result.json --webui
 ```
 
-Use bounds in the actual absolute motor coordinate frame for the intended global
-search region. Configure the
-camera exposure/gain consistently before alignment; the existing helper fetches
-JPEG snapshots and stores them as TIFF without setting those camera parameters.
+## Offline replay
 
-The adapter uses foreground functions and executes each move immediately with
-`item_execute`, checking its specific item UID in plan history for successful
-completion. This follows the [QueueServer execution API](https://blueskyproject.io/bluesky-queueserver/re_manager_api.html).
-Reserve the instrument for alignment and start with an idle worker. A rejected
-request, failed/stopped/aborted move, paused plan, or expired task raises an error.
-Timeouts and connection loss leave remote execution potentially unresolved;
-inspect QueueServer and the motor state before starting another run. Each image
-gets a unique filename so repeated confirmations retain separate files.
+A manifest contains `units: "um"` and `samples`, each with a two-element
+`position` and an `image` path relative to the manifest. Run:
+
+```sh
+uv run --project scripts --locked python scripts/align_osa.py \
+  --config scripts/alignment.json --manifest recorded.json --start X Y \
+  --log replay.jsonl --output replay-result.json --webui
+```
+
+Replay requires an image at every exact acquisition position requested by the
+workflow; repeated images at one position cycle through that position's files.
+The final intersection move needs no recorded image because it performs no
+acquisition. Missing search positions stop replay. Sparse regular scans will
+usually lack the continuous positions required by the directed workflow.
+
+## Live dashboard
+
+`--webui` serves a read-only dashboard on loopback (default port 8765).
+`--webui-port 0` chooses an available port. Access it locally or through an SSH
+forward. It polls the JSONL log once per second. All motor control remains in
+the controller.
+
+The top row shows the latest cropped acquisition with its axis and brightness
+arrow, plus accepted motor-space lines, the readback trajectory, and intersection.
+The trajectory has equal motor-coordinate scales. Drag to pan, Shift-drag to
+zoom, and Reset view to return to the full range. Acquisition history includes
+accept/reject/failure, motor position, both mismatches, Δ, axis angle, fitted
+intensity slope, direction, and reasons. Click a row to browse its image; Go to
+live resumes following the latest acquisition. At exit, a self-contained HTML
+snapshot embeds all available image previews beside the log.
 
 ## Logs and outcomes
 
-Observation stages are `baseline`, `stage1_init`, `stage1`, `stage_2_init`,
-`stage_2`, and `final`. The `_init` stages identify initialization measurements;
-`stage1` identifies M1 refinement by the configured optimizer; `stage_2` identifies
-Bayesian optimization of M2.
-Stage 2 transition and model records also use `stage_2`.
+JSONL records settings, acquisition attempts, observations, move plans, completed
+moves, the intersection, faults, and completion. A fresh log path is required.
+Image/fitting failures remain available in history when an image was acquired.
 
-Every acquisition logs measured position, commanded target, metrics, image path, a textual observation, a comparison with the preceding image,
-and a next-plan statement. Descriptions include boundary coverage, unsupported
-arc lengths, hole mean and peak, and left/right/top/bottom ring brightness when
-a candidate fit is available. Ring sector means and hole peak use input intensity
-units; the evaluator's hole mean uses its background correction. Each concrete
-decision is logged before execution.
-Logs are JSONL and must use a new path per run. Restart from actual readbacks with
-a fresh baseline; automatic continuation of an interrupted run is not provided.
+- `aligned`: enough valid lines were collected and the intersection move passed
+  readback verification.
+- `acquisition_limit`: the image limit was reached with too few accepted axes;
+  no further search move is issued.
+- `blocked`: fitting/direction, readback, acquisition, bounds, or intersection
+  failure; no recovery move is issued.
 
-Results distinguish the best historical observation, the final observation, and
-final measured position. A motor or acquisition fault gives `blocked` without
-blind recovery. Exhausted search with confirmed feasible geometry gives
-`best_found`. Unconfirmed or infeasible final geometry gives `unconfirmed`.
-`metric_target_reached` requires all final reimages to satisfy both the M1 bound
-and explicit `stage_2_target_m2`. Omitting the M2 target reports the best result without
-asserting optimality. This numerical result supports the skill's visual criteria;
-a low central-leakage score alone cannot exclude every localized bright defect.
+The result includes the actual `final_readback`, `final_observation`, accepted
+`lines`, `intersection` diagnostics, and counts. A non-aligned run exits with code
+2. Nearly parallel accepted lines can yield a large condition number; the value
+is reported alongside the inferred intersection. The result describes this
+geometric procedure's outcome, rather than a separate final-image assessment.

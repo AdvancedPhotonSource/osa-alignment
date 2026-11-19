@@ -10,18 +10,14 @@
       30.0
     ]
   ],
-  "max_step": 30,
-  "min_step": 0,
-  "max_acquisitions": 60,
-  "stage_2_entrance_m1": 0.12,
+  "max_acquisitions": 20,
+  "valid_axes_required": 6,
+  "reverse_step_um": 5,
+  "lateral_step_um": 5,
   "readback_tolerance": 10,
-  "stage_1_max_acquisitions": 30,
-  "stage_2_bo_halfwidth": [5, 5],
-  "bo_initial_samples": 10,
-  "bo_initialization": "grid",
-  "stage_1_optimizer": "quadratic",
-  "stage_1_grid_spacing": 1.0,
-  "stage_2_grid_spacing": 0.1,
-  "gp_noise": 0.02,
-  "gp_position_source": "requested"
+  "evaluator": {
+    "crop_xyxy": [276, 73, 616, 413],
+    "sigma": 1.5,
+    "mismatch_relative_tolerance": 0.1
+  }
 }

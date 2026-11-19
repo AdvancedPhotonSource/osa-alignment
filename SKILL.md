@@ -1,246 +1,75 @@
 ---
 name: osa-alignment
-description: Align an order sorting aperture (OSA) in a synchrotron X-ray microscope using ellipse metrics and Bayesian optimization to evaluate illumination and adjust transverse position. Use for automated OSA alignment, and diagnosing asymmetric donut illumination or stray signal in its central hole.
+description: Align an order sorting aperture using directed brightness-reflection axes and the least-squares intersection of their motor-space lines. Use for automated OSA alignment, including strongly distorted images without a recognizable ring.
 ---
 
 # OSA alignment
 
-An order sorting aperture blocks unwanted diffraction orders from the focusing
-optics while passing the intended focused order. Alignment of the OSA relative
-to the optics should produce a symmetric, complete donut with a clean, dark hole.
-The two quantitative objectives are well-defined concentric boundaries and low
-central hole intensity relative to the annulus.
+Run the symmetry-guided controller in [scripts/align_osa.py](scripts/align_osa.py).
+The procedure uses the brightness pattern in a configured detector crop. Its
+image-to-motor mapping is image right → motor +x and image down → motor −y.
+Motor positions and step distances are in micrometers.
 
-**Use the analytical scripts by default.** They handle image evaluation and the
-two-stage Bayesian motor search. Detailed input formats, configuration parameters,
-and integration instructions are in [the analytical guide](references/analytical-alignment.md).
+## Workflow
 
-## Recognize the target in words
+1. Acquire at the actual starting readback and crop the image. Locate the
+   brightness-reflection axis using polar angular FFT self-convolution, then
+   refine its angle and perpendicular displacement locally.
+2. Sample the original pixel intensities along the fitted axis and fit a line
+   against signed pixel distance. Orient the axis toward increasing fitted
+   intensity.
+3. Compare reflection mismatch E about this axis with E⊥ about its perpendicular
+   through the closest axis point to the intensity centroid. Reject if
+   `abs(E⊥ − E) / max(E⊥, E) <= mismatch_relative_tolerance` (default 0.10).
+   Both-zero mismatch also rejects. After rejection, move opposite the directed
+   axis by `reverse_step_um` (default 5).
+4. For an accepted axis, store a motor-space line through the acquisition's
+   actual readback, oriented by the mapped image axis. Move to the axis's
+   3 o'clock side by `lateral_step_um` (default 5).
+5. As soon as `valid_axes_required` lines have been stored (default 6), solve
+   their unweighted least-squares intersection and move directly there. This
+   replaces the lateral move after the last required axis and completes the run.
 
-Evaluate the following features together. A dark hole alone is insufficient,
-and maximum total brightness is not the objective.
+Stop at the current position on an acquisition/fitting/direction failure,
+rank-deficient intersection, motor fault, or out-of-bounds target. Stop after
+`max_acquisitions` images (default 20) if too few axes were accepted. These stops
+perform no additional motor move. A successful result reports the intersection
+and final readback; the most recent image is the last search acquisition.
 
-- **Ring shape and continuity:** A good image has a nearly circular, continuous
-  annulus. Its inner and outer boundaries are approximately concentric, with
-  comparable ring thickness on opposing sides. Look for a missing sector,
-  flattened or clipped edge, indentation, crescent, or lopsided outer envelope.
-- **Angular balance:** Opposing sectors should have broadly similar brightness
-  and extent. A bright half-ring facing a dim, diffuse, or missing half indicates
-  misalignment. Fine grain, radial texture, and modest brightness variation are
-  present even in the good reference; a perfectly smooth white ring is not required.
-- **Central hole:** The center should be a clearly enclosed, approximately round,
-  dark region, free of distinct bright spots, spokes, streaks, or tongues of light
-  intruding from the ring. “Clean” means no conspicuous stray structure above the
-  local dark signal; it does not require every central pixel to be zero.
-- **Exterior:** Faint haze, isolated spots, or weak rays beyond the outer boundary
-  can be tolerated when the ring is balanced and the hole is clean. Strong
-  one-sided spill associated with ring distortion supports a misalignment diagnosis.
+## Run
 
-Symmetry is assessed about the donut's own center; its location in the detector
-frame is not itself the alignment criterion. A cropped ring, detector clipping,
-or darkness from loss of illumination cannot establish good alignment.
-
-### Observed examples
-
-These descriptions are sufficient to guide inspection without loading the example
-images. PNG links are optional visual aids. Offsets below are labels in micrometers,
-relative to the aligned reference, not absolute motor readbacks.
-
-| Offset (x, y), µm | Appearance and interpretation | Optional PNG |
-| --- | --- | --- |
-| (0, 0) | Good reference: a complete, bright, nearly circular annulus around a round dark hole. The hole is roughly one third of the outer diameter. Ring texture includes fine radial lines and mottling; the outer edge is soft, with a slightly diffuse right side. There is no conspicuous bright spot or spoke inside the hole. The donut sits right of the frame center, with faint exterior haze and a faint isolated mark farther right; these do not invalidate it. | [Good alignment](assets/aligned.png) |
-| (−15, 0) | The right side forms a bright C-shaped arc; the left side is weaker and spills outward into broad, roughly horizontal streaks. The central hole remains recognizable but has uneven light structure. The opposed sectors are substantially unbalanced. | [Left-side distortion](assets/x_m15_y_0.png) |
-| (+15, 0) | A bright left crescent faces a much dimmer, textured right arc. Radial streaks converge toward an irregular dark center, and the upper ring is poorly defined. This is not a balanced annulus even though a dark central region remains. | [Right-side distortion](assets/x_15_y_0.png) |
-| (0, +15) | The lower and side arcs remain bright while the upper sector fades into an upward diffuse plume. Bright spoke-like features intrude into the central hole. Both the angular balance and hole cleanliness are worse than the reference. | [Upper-sector distortion](assets/x_0_y_15.png) |
-| (+15, −15) | A conspicuous bright compact spot lies in the central region, with several rays extending toward the upper and left sectors. The surrounding ring is dim and uneven. The internal bright signal makes this unacceptable even if parts of the outer contour look round. | [Contaminated hole](assets/x_15_y_m15.png) |
-
-Small offsets can produce images that resemble the reference closely. Appearance
-alone does not establish an exact motor offset; the controller searches the
-configured motor bounds directly. Example PNG brightness is qualitative,
-not calibrated photon counts.
-
-## Script usage
-
-Run commands from the skill directory using the local `uv` environment:
+Set absolute motor `bounds`, `readback_tolerance`, and `evaluator.crop_xyxy` in
+[scripts/alignment.json](scripts/alignment.json). The supplied crop is
+`[276, 73, 616, 413]`, with exclusive upper bounds, matching the recorded study.
+Set `evaluator.crop_xyxy` to `[]` or `null` to center a square on the first image's
+intensity centroid. Its side starts at 128 pixels and grows in 128-pixel steps
+until it contains at least 95% of that frame's total intensity. The run reuses
+these bounds for every image.
+The supplied adapter uses the APS 2-ID-D QueueServer; acquire and readback calls
+must return locally accessible image paths and coordinates in micrometers.
 
 ```sh
-uv sync --project scripts --locked
-```
-
-### Evaluate an image
-
-[scripts/evaluate_alignment.py](scripts/evaluate_alignment.py) fits concentric
-ellipses and returns M1 (boundary error and completeness) and M2 (centrally weighted
-hole-to-annulus mean intensity ratio). Lower values are better. M1 stays finite on failed fits using the best available
-optimizer geometry; M2 remains infinite when the fit is invalid.
-
-```sh
-uv run --project scripts --locked python scripts/evaluate_alignment.py IMAGE --output metrics.json
-```
-
-Supply both `--inner-axes A B` and `--outer-axes A B` to fix semiaxes in pixels;
-otherwise they are fitted. Add `--min-eccentricity E` to require both ellipses to
-have focal-distance-to-major-semiaxis ratio \(c/a\ge E\), where \(0\le E<1\).
-Omit it for an unconstrained fit. See [metric details](references/analytical-alignment.md#quantitative-evaluation)
-for normalization, fit diagnostics, and options. 
-
-The script can also estimate semiaxes from a well-shaped image with a complete,
-clearly defined annulus. Run the command above without `--inner-axes` or
-`--outer-axes`, check that `valid` is true, and read `fit.inner_axes` and
-`fit.outer_axes` from the JSON output (semiaxes in pixels). These estimates can
-then be supplied as fixed semiaxes for evaluating subsequent alignment images.
-
-Use `--pre-blur-sigma 1` (or `evaluator.pre_blur_sigma: 1`) to apply a 1-pixel
-Gaussian blur before intensity normalization, edge detection, and ellipse fitting.
-The default is 0, which disables pre-blurring. Canny retains its own `sigma`
-smoothing (default 2 pixels). M2 measures the original image intensities.
-**Supply the best guess of the semiaxes whenever possible as they are important for accurate fitting**.
-
-#### Definitions and interpretation of the M1 and M2 metrics
-
-**M1 (`primary_metric`) measures boundary geometry and completeness.** The inner
-and outer ellipses share a center and orientation. For a valid fit,
-
-\[
-M_1 = \frac{d_{\mathrm{inner}} + d_{\mathrm{outer}}}{2\sqrt{a_o b_o}}
-      + \lambda\left(1-\frac{C_{\mathrm{inner}}+C_{\mathrm{outer}}}{2}\right).
-\]
-
-Here, each \(d\) is the RMS distance in pixels from a fitted boundary to its
-corresponding detected edges; \(a_o,b_o\) are the outer semiaxes. Each \(C\) is the
-fraction of boundary samples supported by an edge within the configured distance
-tolerance. The evaluator samples 360 polar angles per boundary and defaults to
-\(\lambda=0.5\). M1 is dimensionless: lower values indicate closer boundary matches
-and fewer unsupported arcs. With complete coverage, M1 = 0.02 means the mean
-boundary RMS distance is 2% of the outer equal-area radius. With incomplete
-coverage, the score also includes the missing-arc penalty. M1 does not directly
-measure angular brightness balance or contamination inside the hole.
-
-**M2 (`secondary_metric`) measures centrally weighted hole brightness relative
-to the annulus, with an optional intensity-centroid penalty.**
-
-\[
-M_2 = \frac{1}{S}
-      \frac{\sum_{p\in H} g_p(I_p-B)/\sum_{p\in H}g_p}
-           {\sum_{p\in A}(I_p-B)/|A|}
-      \left(1 + \lambda\,\frac{d}{r_i}\right),
-\qquad
-g_p = \exp\left[-\frac{\rho_p^2}{2(0.25)^2}\right],
-\qquad
-\rho_p^2 = (u_p/a_i)^2 + (v_p/b_i)^2.
-\]
-
-Here \(H\) is the fitted hole (\(\rho_p<1\)), \(A\) is the annulus between the
-fitted boundaries, and \((u_p,v_p)\) are coordinates relative to the fitted center,
-rotated into the ellipse frame. The Gaussian width is fixed at one quarter of
-each inner semiaxis. Central weighting and annulus normalization are always active.
-\(B\) is the configured scalar background and \(S\) is `intensity_normalizer`,
-an additional score divisor (defaults: 0 and 1). The ratio is dimensionless and
-cancels uniform multiplicative intensity changes when background is scaled
-consistently and pixels are unclipped. Lower M2 means less central leakage;
-strict monotonicity with motor-position error is not guaranteed.
-
-The final factor penalizes asymmetry. \(d\) is the distance from the inner ellipse
-center to the intensity-weighted centroid of the hole, \(r_i=\sqrt{a_i b_i}\) is the
-inner equal-area radius, and \(\lambda\) is `hole_asymmetry_weight` (default 0,
-disabling the penalty). The centroid uses the full hole with weights
-\(\max(I_p-B,0)\); an empty hole has zero offset.
-
-`hole_weighted_mean` and `annulus_mean` report the numerator and denominator.
-`hole_integral`, `hole_mean`, and `hole_to_annulus_ratio` retain their full-region
-diagnostic definitions. Calibrate absolute M2 stopping thresholds for this
-dimensionless score; thresholds from the integrated-intensity metric do not apply.
-
-### Run alignment
-
-[scripts/align_osa.py](scripts/align_osa.py) aligns the OSA in two stages.
-By default, Stage 1 measures a regular 4×4 grid across the full `bounds`, then
-refits a quadratic to all finite M1 observations after each measurement and
-acquires at its bounded minimum until `stage_1_max_acquisitions` is used up.
-The first Stage 2 measurement and initial search-box center are at the final
-quadratic minimum. Set `stage_1_optimizer: "bo"` to use the M1 GP and enter
-Stage 2 when its minimum posterior mean meets `stage_2_entrance_m1` or the
-Stage 1 budget is used up.
-The baseline counts toward the Stage 1 budget. Stage 2 uses configurable
-initialization and local Bayesian optimization to minimize M2, retaining its
-M1 eligibility constraint and neighborhood exclusions. The final position is the
-best eligible observation, verified by repeated images. If none is eligible,
-return to the lowest observed M1 and report an unconfirmed result.
-Set `stage_2_eligibility_m1` to control M2 eligibility and exclusions separately
-from the entrance threshold; when omitted, it uses `stage_2_entrance_m1`.
-
-No calibration file, centroid vector, reference center, Jacobian, or eta is used.
-The bundled [alignment settings](scripts/alignment.json) allocate 30 of the 60
-acquisitions to Stage 1, use `M1 <= 0.12` for M2 eligibility, and
-reserve two final confirmation images from the total budget. Set `bounds` for
-the intended global search region and motor coordinate frame. Random
-initialization in both stages ignores `min_step`/`max_step`, moving directly to
-each sampled target within global bounds. Stage 2 retains its local box and M1
-exclusions. Its center stays fixed during random initialization, then follows the
-minimum of the M2 GP posterior mean. Subsequent moves respect `max_step`; distant Stage 1 BO targets and
-final returns use bounded transit moves without acquisitions.
-Set `bo_initial_samples` for both stages (Stage 1 includes the baseline; Stage 2
-counts eligible initialization measurements, including its entry measurement).
-The Stage 1 budget must accommodate `bo_initial_samples`.
-Set `bo_initialization` to `grid` (default) or `random`. Grid initialization
-measures a regular 4×4 grid spanning each stage's bounds, in addition to the
-baseline and Stage 2 entry measurement. Stage 2 uses the clipped entry box and
-completes all 16 grid measurements before adapting it. Grid initialization moves
-directly to each location and measures even inside M1 exclusions; M2 eligibility
-still controls GP training and final selection. `bo_initial_samples` applies to
-random mode. Grid mode requires a Stage 1 budget of at least 17 and a total budget
-of at least `stage_1_max_acquisitions + 17 + confirmations`. Recorded backends
-must provide every grid location.
-Set `stage_1_optimizer` to `quadratic` for sequential quadratic minimization after
-the Stage 1 grid (`bo_initialization: "grid"`). The default is `quadratic`. Quadratic mode
-fits all finite M1 observations, including the baseline and repeats, with a full
-2D least-squares quadratic. Each new measurement is at its minimum over `bounds`.
-Refit after each image until the Stage 1 budget is used, then start Stage 2 at the
-final refitted minimum. Stage 2 keeps its grid initialization and M2 BO behavior.
-Quadratic targets use continuous coordinates and may revisit measured locations.
-For random initialization, set `bo_initialization: "random"` and
-`stage_1_optimizer: "bo"` together.
-Set `stage_1_grid_spacing` and `stage_2_grid_spacing` for the acquisition candidate
-grids (defaults: 1 and 0.1 in motor units, respectively). Stage 1 covers the global
-bounds; Stage 2 covers its clipped local box. EI is evaluated at every surviving
-grid point; random-mode initialization samples from that grid. Recorded replay
-uses its available positions.
-Configure image fitting through `evaluator`. Supplying both
-`inner_axes` and `outer_axes` is strongly recommended for accurate fitting.
-
-```sh
-uv run --project scripts --locked python scripts/align_osa.py \
+uv sync --project scripts --locked --group beamline
+uv run --project scripts --locked --group beamline python scripts/align_osa.py \
   --config scripts/alignment.json \
-  --adapter beamline_adapter:create_adapter --adapter-config beamline.json \
-  --log trajectory.jsonl --output result.json
+  --adapter aps2idd_adapter:create_adapter --adapter-config scripts/aps2idd.adapter.json \
+  --log trajectory.jsonl --output result.json --webui
 ```
 
-For APS 2-ID-D, use the [QueueServer adapter](references/analytical-alignment.md#aps-2-id-d-queueserver-adapter)
-with the server URL in `scripts/aps2idd.adapter.json` and the documented worker
-helpers loaded. Other facilities can implement the
-[adapter interface](references/analytical-alignment.md#beamline-adapter-placeholder).
-For recorded images, use [offline replay](references/analytical-alignment.md#offline-replay).
+Use a fresh log path for every run. `--webui-port 0` selects an available local
+port. Share the printed URL while the controller runs. The dashboard shows the
+latest crop and directed symmetry axis at the top, accepted motor-space lines,
+the move trajectory, intersection, and acquisition history. Drag the search
+plot to pan; Shift-drag selects a zoom region; Reset view restores the full view.
+Click an acquisition to inspect its image and Go to live to follow the run.
+A self-contained HTML snapshot is saved beside the JSONL log at exit.
 
-Add `--webui` to show a read-only live dashboard with the run settings, latest
-image, search trajectory, and M1/M2 histories. The script prints its local URL
-(default `http://127.0.0.1:8765/`); `--webui-port PORT` selects another port,
-and `0` selects an available port. Agents can enable this flag and share the URL
-while keeping the alignment process running. The dashboard refreshes every second
-and requires no browser on the agent's host. At exit, a self-contained HTML
-snapshot is saved beside the trajectory log. See
-[dashboard access and lifecycle](references/analytical-alignment.md#live-dashboard).
+To evaluate a single image:
 
-[Alignment settings](references/analytical-alignment.md#alignment-settings) configure
-motor bounds, step limits, thresholds, GP parameters, and acquisition budgets.
-The script handles readback verification, trial recovery, confirmation, and
-trajectory logging. Its result distinguishes the best observation from the actual
-final position. See [output statuses](references/analytical-alignment.md#logs-and-outcomes).
-`metric_target_reached` means the configured numerical criteria were met; the
-image criteria above also account for localized bright defects in the hole.
+```sh
+uv run --project scripts --locked python scripts/evaluate_alignment.py IMAGE \
+  --crop 276 73 616 413 --output symmetry.json
+```
 
-## Manual fallback
-
-Use [the manual alignment guide](references/manual-alignment.md) only when the
-scripts cannot proceed or complete alignment, or the user explicitly requests
-manual search. Read its operating and logging instructions when selecting that
-fallback.
+See [the analytical guide](references/analytical-alignment.md) for the numerical
+contracts, settings, adapter interface, exact-position replay, and result fields.

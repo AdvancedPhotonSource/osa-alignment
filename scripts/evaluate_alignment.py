@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Fit concentric OSA boundaries and measure geometry and central leakage.
-
-Coordinates and semiaxes are in pixels; x increases rightward and y
-downward. Ellipse A-axis orientation is clockwise from +x, modulo 180 degrees.
-Run with `uv run --project <scripts-dir> <scripts-dir>/evaluate_alignment.py --help`.
-"""
-
+"""Crop an OSA image and measure its directed brightness-reflection axis."""
 from __future__ import annotations
 
 import argparse
@@ -15,65 +9,38 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy import ndimage as ndi
-from scipy.optimize import least_squares
-from skimage.feature import canny
-from skimage.transform import hough_circle, hough_circle_peaks, resize
+from scipy.ndimage import map_coordinates
+
+from symmetry import fit_symmetry
 
 
 @dataclass(frozen=True)
 class Config:
-    inner_axes: tuple[float, float] | None = None
-    outer_axes: tuple[float, float] | None = None
-    min_eccentricity: float | None = None
-    sigma: float = 2.0
-    edge_low: float = 0.04
-    edge_high: float = 0.10
-    coverage_weight: float = 0.5
-    edge_tolerance: float | None = None
-    min_coverage: float = 0.65
-    max_gap_degrees: float = 90.0
-    background: float = 0.0
-    intensity_normalizer: float = 1.0
-    pre_blur_sigma: float = 0.0
-    hole_asymmetry_weight: float = 0.0
+    crop_xyxy: tuple[int, ...] | None = (276, 73, 616, 413)
+    sigma: float = 1.5
+    angle_samples: int = 720
+    angle_bound_deg: float = 10.
+    offset_bound_px: float = 10.
+    max_candidates: int = 3
+    evaluation_step: int = 2
+    mismatch_relative_tolerance: float = 0.10
 
     def validate(self):
-        if self.min_eccentricity is not None:
-            if not np.isfinite(self.min_eccentricity) or not 0 <= self.min_eccentricity < 1:
-                raise ValueError("min_eccentricity must be finite and in [0, 1)")
-        if (self.inner_axes is None) != (self.outer_axes is None):
-            raise ValueError("Supply both inner_axes and outer_axes, or neither")
-        if self.inner_axes is not None:
-            if (len(self.inner_axes) != 2 or len(self.outer_axes) != 2
-                or not np.isfinite([*self.inner_axes, *self.outer_axes]).all()
-                or not all(0 < i < o for i, o in zip(self.inner_axes, self.outer_axes))):
-                raise ValueError("Supply two positive semiaxes per ellipse, with each inner axis < outer axis")
-            if self.min_eccentricity is not None:
-                for axes in (self.inner_axes, self.outer_axes):
-                    ratio = min(axes) / max(axes)
-                    if ratio > np.sqrt(1 - self.min_eccentricity**2):
-                        raise ValueError("Fixed axes do not meet min_eccentricity")
-        if not np.isfinite(self.pre_blur_sigma) or self.pre_blur_sigma < 0:
-            raise ValueError("pre_blur_sigma must be nonnegative and finite")
-        if not (np.isfinite(self.sigma) and self.sigma > 0):
-            raise ValueError("sigma must be positive and finite")
-        if not 0 < self.edge_low < self.edge_high <= 1:
-            raise ValueError("Require 0 < edge_low < edge_high <= 1")
-        if not 0 <= self.min_coverage <= 1 or not 0 < self.max_gap_degrees <= 360:
-            raise ValueError("Invalid coverage or angular-gap threshold")
-        if not np.isfinite(self.coverage_weight) or self.coverage_weight < 0:
-            raise ValueError("coverage_weight must be nonnegative and finite")
-        if self.edge_tolerance is not None and not (
-            np.isfinite(self.edge_tolerance) and self.edge_tolerance > 0
-        ):
-            raise ValueError("edge_tolerance must be positive and finite")
-        if not np.isfinite(self.background):
-            raise ValueError("background must be finite")
-        if not np.isfinite(self.intensity_normalizer) or self.intensity_normalizer <= 0:
-            raise ValueError("intensity_normalizer must be positive and finite")
-        if not np.isfinite(self.hole_asymmetry_weight) or self.hole_asymmetry_weight < 0:
-            raise ValueError("hole_asymmetry_weight must be nonnegative and finite")
+        crop = self.crop_xyxy
+        if crop is not None and not isinstance(crop, (list, tuple)):
+            raise ValueError("crop_xyxy must be an array of bounds or null")
+        if crop and (len(crop) != 4 or any(type(v) is not int for v in crop)
+                     or min(crop) < 0 or crop[2] - crop[0] < 16 or crop[3] - crop[1] < 16):
+            raise ValueError("crop_xyxy must be nonnegative integer exclusive bounds, at least 16 x 16")
+        numbers = [self.sigma, self.angle_bound_deg, self.offset_bound_px,
+                   self.mismatch_relative_tolerance]
+        if (not np.isfinite(numbers).all() or self.sigma < 0
+            or not 0 < self.angle_bound_deg < 90 or self.offset_bound_px <= 0
+            or not 0 <= self.mismatch_relative_tolerance < 1):
+            raise ValueError("Invalid smoothing, refinement bounds, or mismatch_relative_tolerance")
+        if (any(type(v) is not int for v in [self.angle_samples, self.max_candidates, self.evaluation_step])
+            or self.angle_samples < 16 or self.max_candidates < 1 or self.evaluation_step < 1):
+            raise ValueError("Require >=16 angular samples, >=1 candidate and positive integer evaluation_step")
 
 
 def grayscale(array: np.ndarray) -> np.ndarray:
@@ -93,289 +60,6 @@ def read_image(path: str | Path) -> np.ndarray:
         return grayscale(np.asarray(image))
 
 
-def _largest_gap(supported: np.ndarray) -> float:
-    missing = ~supported
-    if missing.all():
-        return 360.0
-    longest = current = 0
-    for value in np.tile(missing, 2):
-        current = current + 1 if value else 0
-        longest = max(longest, current)
-    return min(longest, len(missing)) * 360.0 / len(missing)
-
-
-def _seeds(normalized: np.ndarray, config: Config) -> list[tuple[float, float, float]]:
-    """Coarse circular Hough peaks initialize center and outer radius."""
-    scale = max(1, int(np.ceil(max(normalized.shape) / 360)))
-    shape = tuple(int(np.ceil(n / scale)) for n in normalized.shape)
-    small = resize(normalized, shape, preserve_range=True, anti_aliasing=True)
-    edges = canny(small, sigma=max(1, config.sigma / scale),
-                  low_threshold=config.edge_low, high_threshold=config.edge_high)
-    outer_scale = (float(np.sqrt(np.prod(config.outer_axes)))
-                   if config.outer_axes is not None else None)
-    if outer_scale is None:
-        # Broad initialization prior: outer radius is 15--35% of the short side.
-        radii = np.arange(max(3, int(min(shape) * 0.15)), int(min(shape) * 0.35) + 1, 2)
-    else:
-        radii = np.array([max(2, round(outer_scale / scale))])
-    hough = hough_circle(edges, radii)
-    peaks, xs, ys, rs = hough_circle_peaks(
-        hough, radii, min_xdistance=max(3, int(radii[0] / 3)),
-        min_ydistance=max(3, int(radii[0] / 3)), total_num_peaks=4,
-    )
-    seeds = [(float(x * scale), float(y * scale),
-              float(outer_scale or r * scale))
-             for strength, x, y, r in zip(peaks, xs, ys, rs) if strength > 0]
-    # A bright annulus centroid supplies a complementary start when Hough peaks
-    # favor internal texture or displaced arcs rather than the whole envelope.
-    labels, count = ndi.label(normalized > 0.5)
-    if seeds and count:
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0
-        cy, cx = ndi.center_of_mass(labels == sizes.argmax())
-        seeds.append((float(cx), float(cy), seeds[0][2]))
-    return seeds
-
-
-def boundary_points(fit: dict, boundary: str, angles: np.ndarray):
-    """Sample at true polar angles about the shared center (not ellipse phase)."""
-    a, b = fit[f"{boundary}_axes"]
-    phase = angles - np.deg2rad(fit["angle_degrees"])
-    radius = 1 / np.sqrt((np.cos(phase) / a) ** 2 + (np.sin(phase) / b) ** 2)
-    return (fit["center_x"] + radius * np.cos(angles),
-            fit["center_y"] + radius * np.sin(angles))
-
-
-def evaluate(image: np.ndarray, config: Config | None = None) -> dict:
-    """Return scores plus fit diagnostics. M1 stays finite even when fit validation fails.
-
-    M1 = mean boundary RMS distance / outer equal-area radius + coverage_weight *
-         mean unsupported angular fraction.
-    M2 = Gaussian-weighted hole mean / annulus mean / intensity_normalizer,
-         scaled by (1 + hole_asymmetry_weight * offset). Both means subtract
-         background from the original image. Gaussian weights are exp(-rho² /
-         (2 * 0.25²)), with rho² = (u/inner_a)² + (v/inner_b)² in the fitted
-         ellipse frame, truncated at rho < 1. Offset is the full hole's intensity
-         centroid distance from the fitted center in inner equal-area radii;
-         its multiplier defaults to zero. M2 is dimensionless.
-    Ellipses share a center and orientation. Coverage uses 360 true polar angles,
-    one degree apart.
-    Failed fits retain the best candidate geometry for M1; M2 is infinite when invalid.
-    """
-    config = config or Config()
-    config.validate()
-    max_axis_ratio = (None if config.min_eccentricity is None else
-                      float(np.sqrt(1 - config.min_eccentricity**2)))
-    image = grayscale(image)
-    height, width = image.shape
-    result = dict(valid=False, reasons=[], config=asdict(config),
-                  image_shape=list(image.shape), fit=None,
-                  secondary_metric=float("inf"),
-                  geometry_score=float("inf"), hole_integral=None)
-    fit_image = ndi.gaussian_filter(image, config.pre_blur_sigma) if config.pre_blur_sigma else image
-    floor, ceiling = np.percentile(fit_image, [10, 99.5])
-    base_reasons = ["No usable intensity contrast"] if ceiling <= floor else []
-    normalized = (np.zeros_like(image) if ceiling <= floor else
-                  np.clip((fit_image - floor) / (ceiling - floor), 0, 1))
-    edges = canny(normalized, sigma=config.sigma,
-                  low_threshold=config.edge_low, high_threshold=config.edge_high)
-    smooth = ndi.gaussian_filter(normalized, config.sigma)
-    gy, gx = np.gradient(smooth)
-    yy, xx = np.indices(image.shape)
-    angles = np.linspace(0, 2 * np.pi, 360, endpoint=False)
-    cos, sin = np.cos(angles), np.sin(angles)
-
-    def distance_maps(cx, cy, geometry=None):
-        # Inner edges brighten outward; outer edges darken outward. Suppress
-        # tangential texture while retaining up to 60 degrees of normal error.
-        maps = []
-        for boundary, sign in (("inner", 1), ("outer", -1)):
-            nx, ny = xx - cx, yy - cy
-            if geometry is not None:
-                a, b = geometry[f"{boundary}_axes"]
-                theta = np.deg2rad(geometry["angle_degrees"])
-                c, s = np.cos(theta), np.sin(theta)
-                u, v = (c * nx + s * ny) / a**2, (-s * nx + c * ny) / b**2
-                nx, ny = c * u - s * v, s * u + c * v
-            alignment = (nx * gx + ny * gy) / np.maximum(
-                np.hypot(nx, ny) * np.hypot(gx, gy), 1e-12)
-            mask = edges & (sign * alignment > 0.5)
-            # No supported edges still supplies a finite residual to the optimizer.
-            maps.append(ndi.distance_transform_edt(~mask) if mask.any() else
-                        np.full(image.shape, np.hypot(height, width)))
-        return maps
-
-    candidates = []
-    # Moments give an orientation seed; the edge fit determines the final axes.
-    seed_angle, seed_ratio = 0.0, 1.0
-    moment_seed = None
-    labels, count = ndi.label(normalized > 0.5)
-    if count:
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0
-        sy, sx = np.nonzero(labels == sizes.argmax())
-        if len(sx) > 2:
-            values, vectors = np.linalg.eigh(np.cov(np.array([sx, sy])))
-            seed_angle = float(np.arctan2(vectors[1, -1], vectors[0, -1]) % np.pi)
-            seed_ratio = float(np.clip(np.sqrt(values[-1] / max(values[0], 1)), 1, 2))
-            # Area plus second moments estimates the outer equal-area
-            # radius of an annulus without mistaking local curvature for it.
-            moment_radius = np.sqrt(2 * np.sqrt(max(np.prod(values), 0)) + len(sx) / (2 * np.pi))
-            if config.outer_axes is None:
-                moment_seed = (float(sx.mean()), float(sy.mean()), float(moment_radius))
-    seeds = _seeds(normalized, config)
-    if moment_seed is not None:
-        seeds.append(moment_seed)
-    if not seeds:
-        radius = (float(np.sqrt(np.prod(config.outer_axes)))
-                  if config.outer_axes is not None else min(image.shape) * 0.25)
-        seeds = [((width - 1) / 2, (height - 1) / 2, radius)]
-    for cx, cy, radius in seeds:
-        maps = distance_maps(cx, cy)
-
-        def unpack(parameters):
-            x, y = map(float, parameters[:2])
-            if config.inner_axes is not None:
-                inner_axes, outer_axes = config.inner_axes, config.outer_axes
-                theta = parameters[2]
-            elif max_axis_ratio is not None and config.min_eccentricity > 0:
-                fraction_a, fraction_b, a, axis_ratio, theta = parameters[2:]
-                b = a * axis_ratio
-                inner_a = fraction_a * a
-                inner_b = fraction_b * min(0.70 * b, max_axis_ratio * inner_a)
-                inner_axes, outer_axes = (inner_a, inner_b), (a, b)
-            else:
-                fraction_a, fraction_b, a, b, theta = parameters[2:]
-                inner_axes, outer_axes = (fraction_a * a, fraction_b * b), (a, b)
-            return dict(model="ellipse", center_x=x, center_y=y,
-                        inner_axes=list(map(float, inner_axes)), outer_axes=list(map(float, outer_axes)),
-                        angle_degrees=float(np.rad2deg(theta) % 180), axes_fixed=config.inner_axes is not None)
-
-        def residuals(parameters):
-            geometry = unpack(parameters)
-            points = [boundary_points(geometry, boundary, angles) for boundary in ("inner", "outer")]
-            return np.concatenate([
-                ndi.map_coordinates(distance, [y, x],
-                                    order=1, mode="constant", cval=radius)
-                for distance, (x, y) in zip(maps, points)
-            ])
-
-        lower = [max(0, cx - radius * 0.3), max(0, cy - radius * 0.3)]
-        upper = [min(width - 1, cx + radius * 0.3), min(height - 1, cy + radius * 0.3)]
-        if config.inner_axes is not None:
-            initial = [cx, cy, seed_angle]
-            lower += [-np.pi]
-            upper += [2 * np.pi]
-        else:
-            trial_radii = np.arange(max(1, radius * 0.12), max(2, radius * 0.65), 1)
-            costs = [np.mean(ndi.map_coordinates(
-                maps[0], [cy + r * sin, cx + r * cos], order=1,
-                mode="constant", cval=radius)) for r in trial_radii]
-            inner = trial_radii[np.argmin(costs)]
-            # Fractions enforce nesting for every angle throughout fitting.
-            fraction = float(np.clip(inner / radius, 0.11, 0.69))
-            if max_axis_ratio is not None and config.min_eccentricity > 0:
-                # Parameterize both minor axes so the bound holds at every
-                # optimizer step, including nonconvergent fits.
-                a = radius * np.sqrt(seed_ratio)
-                axis_ratio = min(1 / seed_ratio, max_axis_ratio)
-                b = a * axis_ratio
-                inner_cap = min(0.70 * b, max_axis_ratio * fraction * a)
-                fraction_b = min(0.99, fraction * b / inner_cap)
-                initial = [cx, cy, fraction, fraction_b, a, axis_ratio, seed_angle]
-                lower += [0.10, 0.01, radius * 0.55, min(0.001, max_axis_ratio / 2), -np.pi]
-                upper += [0.70, 1.0, radius * 1.65, max_axis_ratio, 2 * np.pi]
-            else:
-                initial = [cx, cy, fraction, fraction,
-                           radius * np.sqrt(seed_ratio), radius / np.sqrt(seed_ratio), seed_angle]
-                lower += [0.10, 0.10, radius * 0.55, radius * 0.55, -np.pi]
-                upper += [0.70, 0.70, radius * 1.65, radius * 1.65, 2 * np.pi]
-        fit = least_squares(residuals, initial, bounds=(lower, upper),
-                            diff_step=1e-3, max_nfev=150)
-        # Update edge-normal classification at the fitted center and refine.
-        # Final metrics must depend on the final geometry, not on its seed.
-        maps = distance_maps(*fit.x[:2], unpack(fit.x))
-        fit = least_squares(residuals, fit.x, bounds=(lower, upper),
-                            diff_step=1e-3, max_nfev=150)
-        maps = distance_maps(*fit.x[:2], unpack(fit.x))
-        geometry = unpack(fit.x)
-        x, y = geometry["center_x"], geometry["center_y"]
-        a, b = geometry["outer_axes"]
-        theta = np.deg2rad(geometry["angle_degrees"])
-        outer = float(np.sqrt(a * b))
-        extent_x = np.hypot(a * np.cos(theta), b * np.sin(theta))
-        extent_y = np.hypot(a * np.sin(theta), b * np.cos(theta))
-        geometry["outer_equivalent_radius"] = outer
-        geometry["inner_equivalent_radius"] = float(np.sqrt(np.prod(geometry["inner_axes"])))
-        distances = residuals(fit.x).reshape(2, -1)
-        tolerance = config.edge_tolerance or max(2.0, 0.04 * outer)
-        coverage = (distances <= tolerance).mean(axis=1)
-        rms = np.sqrt(np.mean(distances ** 2, axis=1))
-        score = float(rms.mean() / outer + config.coverage_weight * (1 - coverage.mean()))
-        gaps = [_largest_gap(d <= tolerance) for d in distances]
-        reasons = list(base_reasons)
-        if not fit.success:
-            reasons.append("Optimizer did not converge")
-        if min(x - extent_x, y - extent_y, width - 1 - x - extent_x, height - 1 - y - extent_y) < 0:
-            reasons.append("Outer boundary extends beyond image")
-        if coverage.min() < config.min_coverage:
-            reasons.append("Insufficient angular boundary coverage")
-        if max(gaps) > config.max_gap_degrees:
-            reasons.append("Boundary gap exceeds angular limit")
-        candidates.append(dict(
-            valid=not reasons, reasons=reasons, geometry_score=score,
-            fit=geometry,
-            inner_rms_px=float(rms[0]), outer_rms_px=float(rms[1]),
-            inner_coverage=float(coverage[0]), outer_coverage=float(coverage[1]),
-            inner_max_gap_degrees=gaps[0], outer_max_gap_degrees=gaps[1],
-            edge_tolerance_px=tolerance,
-        ))
-    # Prefer an adequately supported model over a spurious low-residual arc.
-    result.update(min(candidates, key=lambda c: (not c["valid"], c["geometry_score"])))
-    result["primary_metric"] = result["geometry_score"]
-    fit = result["fit"]
-    dx, dy = xx - fit["center_x"], yy - fit["center_y"]
-    theta = np.deg2rad(fit["angle_degrees"])
-    u, v = np.cos(theta) * dx + np.sin(theta) * dy, -np.sin(theta) * dx + np.cos(theta) * dy
-    ia, ib = fit["inner_axes"]
-    oa, ob = fit["outer_axes"]
-    rho2 = (u / ia)**2 + (v / ib)**2
-    hole = rho2 < 1
-    inside_outer = (u / oa)**2 + (v / ob)**2 <= 1
-    annulus = inside_outer & ~hole
-    if not hole.any() or not annulus.any():
-        result["valid"] = False
-        result["reasons"].append("Hole or annulus contains no pixel centers")
-        return result
-    corrected = image - config.background
-    integral = float(corrected[hole].sum())
-    ring_sum = float(corrected[annulus].sum())
-    ring_mean = float(corrected[annulus].mean())
-    # A quarter-semiaxis Gaussian suppresses the bright rim around the hole.
-    central_weights = np.exp(-rho2[hole] / (2 * 0.25**2))
-    weighted_mean = float(np.sum(central_weights * corrected[hole]) / central_weights.sum())
-    # Clip to nonnegative weights: raw (I - background) sums crossing zero send the
-    # weighted centroid to infinity and then flip its sign.
-    weights = np.clip(corrected[hole], 0, None)
-    total = float(weights.sum())
-    # Rotation-invariant in the ellipse frame, so this equals the image-frame distance.
-    offset = 0. if total <= 0 else float(np.hypot((weights * u[hole]).sum() / total,
-                                                  (weights * v[hole]).sum() / total))
-    asymmetry = offset / fit["inner_equivalent_radius"]
-    result.update(hole_integral=integral, hole_area_px=int(hole.sum()),
-                  hole_mean=float(corrected[hole].mean()), annulus_integral=ring_sum,
-                  hole_weighted_mean=weighted_mean, annulus_mean=ring_mean,
-                  hole_to_annulus_ratio=integral / ring_sum if ring_sum > 0 else None,
-                  hole_centroid_offset_px=offset, hole_centroid_offset_fraction=asymmetry)
-    if ring_sum <= 0 or ring_mean <= corrected[hole].mean():
-        result["valid"] = False
-        result["reasons"].append("Annulus is not brighter than the hole above background")
-    if result["valid"]:
-        result["secondary_metric"] = (weighted_mean / ring_mean / config.intensity_normalizer
-                                      * (1 + config.hole_asymmetry_weight * asymmetry))
-    return result
-
-
 def json_safe(value):
     """Use standards-compliant JSON while retaining explicit infinite scores."""
     if isinstance(value, dict):
@@ -387,32 +71,134 @@ def json_safe(value):
     return value
 
 
+def auto_crop_bounds(image):
+    """Smallest square with side a positive multiple of 128 enclosing >=95% of raw grayscale intensity.
+
+    Pixel centers have integer coordinates. Round each lower bound to the
+    nearest integer so the square's center is within half a pixel of the
+    full-frame intensity centroid. Outside-detector intensity is zero.
+    """
+    height, width = image.shape
+    total = image.sum(dtype=float)
+    if total <= 0 or not np.isfinite(total) or (image < 0).any():
+        raise ValueError("Automatic crop requires nonnegative intensity with a finite positive sum")
+    cx = image.sum(axis=0, dtype=float) @ np.arange(width) / total
+    cy = image.sum(axis=1, dtype=float) @ np.arange(height) / total
+    side = 128
+    while True:
+        x0 = round(float(cx) - (side - 1) / 2)
+        y0 = round(float(cy) - (side - 1) / 2)
+        x1, y1 = x0 + side, y0 + side
+        inside = image[max(y0, 0):min(y1, height), max(x0, 0):min(x1, width)]
+        if inside.sum(dtype=float) >= .95 * total:
+            return [x0, y0, x1, y1]
+        side += 128
+
+
+def crop_image(image, crop_xyxy, *, pad=False):
+    """Extract exclusive bounds, zero-padding out-of-frame automatic windows."""
+    x0, y0, x1, y1 = crop_xyxy
+    height, width = image.shape
+    if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+        if not pad:
+            raise ValueError("Configured crop exceeds image dimensions")
+        patch = np.zeros((y1 - y0, x1 - x0), dtype=image.dtype)
+        left, top, right, bottom = max(0, x0), max(0, y0), min(width, x1), min(height, y1)
+        if left < right and top < bottom:
+            patch[top-y0:bottom-y0, left-x0:right-x0] = image[top:bottom, left:right]
+        return patch
+    return image[y0:y1, x0:x1]
+
+
+def axis_segment(point, direction, shape):
+    """Signed distances along a unit axis where it intersects the pixel-center rectangle."""
+    low, high = -np.inf, np.inf
+    for p, v, extent in zip(point, direction, reversed(shape)):
+        if abs(v) < 1e-12:
+            if not 0 <= p <= extent - 1:
+                raise ValueError("Axis does not intersect the image")
+        else:
+            ends = sorted((-p / v, (extent - 1 - p) / v))
+            low, high = max(low, ends[0]), min(high, ends[1])
+    if not np.isfinite([low, high]).all() or high - low < 1:
+        raise ValueError("Axis has insufficient image support")
+    return low, high
+
+
+def directed_axis(image, point, direction):
+    """Orient a fitted axis by the slope of raw intensity versus signed distance.
+
+    Bilinear samples span its full in-crop segment at <=1-pixel spacing. Ordinary
+    least squares fits I(t)=slope*t+intercept; positive slope keeps the supplied
+    direction and negative slope reverses it. A numerically flat profile has no
+    defined direction and stops the workflow.
+    """
+    point, direction = np.asarray(point), np.asarray(direction)
+    low, high = axis_segment(point, direction, image.shape)
+    t = np.linspace(low, high, int(np.ceil(high - low)) + 1)
+    xy = point[:, None] + direction[:, None] * t
+    values = map_coordinates(image, [xy[1], xy[0]], order=1, mode="nearest", prefilter=False)
+    centered = t - t.mean()
+    slope = float(centered @ (values - values.mean()) / (centered @ centered))
+    numerical_floor = 64 * np.finfo(float).eps * max(1., float(np.max(np.abs(values))))
+    if abs(slope) * (high - low) <= numerical_floor:
+        raise ValueError("Along-axis intensity slope is zero; direction is undefined")
+    return {"direction_xy": (direction if slope > 0 else -direction).tolist(),
+            "profile_slope_intensity_per_px": slope,
+            "profile_intercept": float(values.mean() - slope * t.mean()),
+            "profile_distance_px": t.tolist(), "profile_intensity": values.tolist()}
+
+
+def evaluate(image, config=Config(), *, first_image_crop=None):
+    """Return symmetry geometry, brightness direction, and mono-axial acceptance.
+
+    Perpendicular mismatch is evaluated through the fitted axis point closest
+    to the intensity centroid, without a second optimization. Closeness is
+    |Eperp-Eaxis| / max(Eperp,Eaxis); both-zero mismatch also rejects the axis.
+    Configuration errors raise; measurement failures remain in acquisition history.
+    """
+    config.validate()
+    image = grayscale(image)
+    result = {"config": asdict(config), "image_shape": list(image.shape),
+              "crop_xyxy": list(config.crop_xyxy or ()), "valid": False,
+              "error": None, "reasons": [], "fit": None}
+    try:
+        if not config.crop_xyxy:
+            result["crop_xyxy"] = (list(first_image_crop) if first_image_crop is not None
+                                   else auto_crop_bounds(image))
+        patch = crop_image(image, result["crop_xyxy"], pad=not config.crop_xyxy)
+        result["crop_shape"] = list(patch.shape)
+        kwargs = {name: getattr(config, name) for name in
+                  ("sigma", "angle_samples", "angle_bound_deg", "offset_bound_px", "max_candidates", "evaluation_step")}
+        analysis = fit_symmetry(patch, **kwargs)
+        fit = analysis["best_axis"]
+        result.update(fit=fit, centroid_xy_px=analysis["centroid_xy_px"],
+                      fft_score_range=analysis["fft_score_range"], candidates=analysis["candidates"])
+        directed = directed_axis(patch, fit["axis_point_xy_px"], fit["axis_direction_xy"])
+        result.update(directed)
+        a, b = fit["mismatch"], fit["perpendicular_mismatch"]
+        relative = abs(b - a) / max(a, b) if max(a, b) > 0 else 0.
+        result.update(reflection_mismatch=a, perpendicular_mismatch=b, relative_mismatch_difference=relative)
+        result["valid"] = relative > config.mismatch_relative_tolerance
+        if not result["valid"]:
+            result["reasons"].append("Axis and perpendicular reflection mismatches are too close")
+    except (ValueError, RuntimeError) as exc:
+        result["error"] = str(exc)
+        result["reasons"].append(str(exc))
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image", type=Path)
-    parser.add_argument("--output", type=Path, help="JSON destination; default stdout")
-    parser.add_argument("--inner-axes", type=float, nargs=2, metavar=("A", "B"), help="Fixed inner ellipse semiaxes in pixels")
-    parser.add_argument("--outer-axes", type=float, nargs=2, metavar=("A", "B"), help="Fixed outer ellipse semiaxes in pixels; requires inner axes")
-    parser.add_argument("--min-eccentricity", type=float, help="Minimum c/a for both fitted ellipses; 0 allows circles")
-    parser.add_argument("--sigma", type=float, default=2.0, help="Canny smoothing sigma in pixels")
-    parser.add_argument("--pre-blur-sigma", type=float, default=0.0,
-                        help="Additional Gaussian blur before normalization and geometry fitting; 0 disables; M2 uses original intensities")
-    parser.add_argument("--edge-low", type=float, default=0.04)
-    parser.add_argument("--edge-high", type=float, default=0.10)
-    parser.add_argument("--edge-tolerance", type=float, help="Support distance in pixels; default max(2, 0.04 * outer equal-area radius)")
-    parser.add_argument("--coverage-weight", type=float, default=0.5)
-    parser.add_argument("--min-coverage", type=float, default=0.65)
-    parser.add_argument("--max-gap-degrees", type=float, default=90.0)
-    parser.add_argument("--background", type=float, default=0.0, help="Scalar detector background in input intensity units")
-    parser.add_argument("--intensity-normalizer", type=float, default=1.0, help="Positive additional divisor for the dimensionless M2 score")
-    parser.add_argument("--hole-asymmetry-weight", type=float, default=0.0,
-                        help="Weight on the hole intensity centroid offset, in inner equal-area radii; default 0 disables the symmetry penalty")
+    parser.add_argument("--config", type=Path, help="Evaluator Config JSON")
+    parser.add_argument("--crop", type=int, nargs=4, metavar=("X0", "Y0", "X1", "Y1"))
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    config = Config(**{key: getattr(args, key) for key in Config.__dataclass_fields__})
-    try:
-        result = evaluate(read_image(args.image), config)
-    except ValueError as error:
-        parser.error(str(error))
+    options = json.loads(args.config.read_text()) if args.config else {}
+    if args.crop is not None:
+        options["crop_xyxy"] = args.crop
+    result = evaluate(read_image(args.image), Config(**options))
     payload = json.dumps(json_safe(result), indent=2, allow_nan=False) + "\n"
     if args.output:
         args.output.write_text(payload)

@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Align an OSA using global M1 optimization and local M2 Bayesian optimization."""
+"""Align the OSA by intersecting directed brightness-symmetry lines."""
 from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass, field
-from functools import partial
 from datetime import datetime, timezone
 import importlib
 import json
 from pathlib import Path
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.stats import norm
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern
 
 from alignment_io import load_manifest, measure, write_json
 from evaluate_alignment import Config, json_safe
@@ -24,96 +19,36 @@ from evaluate_alignment import Config, json_safe
 class Settings:
     units: str
     bounds: list[list[float]]
-    max_step: float
-    min_step: float = 0.5
     evaluator: dict = field(default_factory=dict)
-    stage_2_entrance_m1: float = 0.02
-    stage_2_eligibility_m1: float | None = None
-    stage_1_max_acquisitions: int = 20
-    max_acquisitions: int = 40
-    confirmations: int = 2
+    valid_axes_required: int = 6
+    reverse_step_um: float = 5.
+    lateral_step_um: float = 5.
+    max_acquisitions: int = 20
     readback_tolerance: float = 0.001
-    stage_2_bo_halfwidth: tuple[float, float] = (5., 5.)
-    gp_length_scale: tuple[float, float] = (2.5, 2.5)
-    gp_length_scale_bounds: tuple[float, float] = (0.5, 10.)
-    bo_initial_samples: int = 5
-    bo_initialization: str = "grid"
-    stage_1_optimizer: str = "quadratic"
-    gp_noise: float = 0.05
-    gp_position_source: str = "requested"
-    stage_2_gp_stage_1_noise_multiplier: float = 3.0
-    ei_xi: float = 0.0
-    stage_2_min_ei: float = 0.0
-    stage_1_grid_spacing: float = 1.0
-    stage_2_grid_spacing: float = 0.1
-    bo_candidates: int | None = None  # Accepted for older configs; grids determine candidate counts.
-    stage_2_target_m2: float | None = None
-    seed: int = 0
-
-    @property
-    def m2_eligibility_threshold(self):
-        return self.stage_2_entrance_m1 if self.stage_2_eligibility_m1 is None else self.stage_2_eligibility_m1
 
     def validate(self):
         bounds = np.asarray(self.bounds, float)
-        if (not np.isfinite([self.stage_1_grid_spacing, self.stage_2_grid_spacing]).all()
-            or min(self.stage_1_grid_spacing, self.stage_2_grid_spacing) <= 0):
-            raise ValueError("Grid spacings must be finite and positive")
-        if (not np.isfinite([self.min_step, self.max_step]).all()
-            or self.max_step <= 0 or not 0 <= self.min_step <= self.max_step):
-            raise ValueError("Require max_step > 0 and 0 <= min_step <= max_step")
-        numbers = [self.max_step, self.min_step, self.stage_2_entrance_m1,
-                   self.readback_tolerance,
-                   *self.stage_2_bo_halfwidth, *self.gp_length_scale, *self.gp_length_scale_bounds, self.gp_noise, self.ei_xi, self.stage_2_min_ei,
-                   self.stage_2_gp_stage_1_noise_multiplier]
+        if self.units != "um":
+            raise ValueError("Symmetry alignment uses motor coordinates in um")
         if (bounds.shape != (2, 2) or not np.isfinite(bounds).all()
-            or np.any(bounds[:, 0] >= bounds[:, 1]) or not np.isfinite(numbers).all()
-            or min(self.stage_2_bo_halfwidth) <= 0 or len(self.stage_2_bo_halfwidth) != 2
-            or min(self.gp_length_scale) <= 0 or len(self.gp_length_scale) != 2
-            or len(self.gp_length_scale_bounds) != 2
-            or not 0 < self.gp_length_scale_bounds[0] < self.gp_length_scale_bounds[1]
-            or any(not self.gp_length_scale_bounds[0] <= v <= self.gp_length_scale_bounds[1]
-                   for v in self.gp_length_scale)
-            or self.gp_noise <= 0 or self.readback_tolerance <= 0
-            or self.stage_2_gp_stage_1_noise_multiplier < 1
-            or min(self.ei_xi, self.stage_2_min_ei) < 0):
-            raise ValueError("Invalid bounds, thresholds, step sizes, or GP settings")
-        if (not all(isinstance(x, int) for x in [self.max_acquisitions, self.confirmations,
-                                               self.bo_initial_samples, self.stage_1_max_acquisitions, self.seed])
-            or self.confirmations < 2 or self.max_acquisitions < self.confirmations + 3
-            or not 1 <= self.stage_1_max_acquisitions < self.max_acquisitions - self.confirmations
-            or self.bo_initial_samples < 0 or self.seed < 0):
-            raise ValueError("Require >=2 confirmations and sufficient acquisition budget")
-        if self.stage_2_target_m2 is not None and not np.isfinite(self.stage_2_target_m2):
-            raise ValueError("stage_2_target_m2 must be finite")
-        if not np.isfinite(self.m2_eligibility_threshold) or self.m2_eligibility_threshold <= 0:
-            raise ValueError("stage_2_eligibility_m1 must be finite and positive")
-        if self.bo_initialization not in {"random", "grid"}:
-            raise ValueError("bo_initialization must be 'random' or 'grid'")
-        if self.gp_position_source not in {"readback", "requested"}:
-            raise ValueError("gp_position_source must be 'readback' or 'requested'")
-        if self.stage_1_optimizer not in {"bo", "quadratic"}:
-            raise ValueError("stage_1_optimizer must be 'bo' or 'quadratic'")
-        if self.stage_1_optimizer == "quadratic" and self.bo_initialization != "grid":
-            raise ValueError("Quadratic Stage 1 requires grid initialization")
-        if self.bo_initialization == "grid":
-            if self.stage_1_max_acquisitions < 17:
-                raise ValueError("Grid initialization requires a baseline plus 16 Stage 1 measurements")
-            if self.max_acquisitions < self.stage_1_max_acquisitions + 17 + self.confirmations:
-                raise ValueError("Grid initialization requires budget for Stage 2 entry plus 16 measurements and confirmations")
-        elif self.bo_initial_samples > self.stage_1_max_acquisitions:
-            raise ValueError("stage_1_max_acquisitions must accommodate bo_initial_samples")
+            or np.any(bounds[:, 0] >= bounds[:, 1])):
+            raise ValueError("Require finite increasing x/y motor bounds")
+        values = [self.reverse_step_um, self.lateral_step_um, self.readback_tolerance]
+        if not np.isfinite(values).all() or min(values) <= 0:
+            raise ValueError("Step distances and readback_tolerance must be finite and positive")
+        if (type(self.valid_axes_required) is not int or type(self.max_acquisitions) is not int
+            or not 2 <= self.valid_axes_required <= self.max_acquisitions):
+            raise ValueError("Require 2 <= valid_axes_required <= max_acquisitions")
         Config(**self.evaluator).validate()
 
 
 class Replay:
-    """Discrete replay of recorded images. Repeated reads are not new measurements."""
+    """Exact recorded-image replay; continuous targets are never snapped or interpolated."""
     def __init__(self, manifest, start):
         self.units = manifest["units"]
         self.images = {}
         for row in manifest["samples"]:
             self.images.setdefault(tuple(row["position"]), []).append(row["image"])
-        self.candidate_positions = np.array(list(self.images), float)
         self.counts = dict.fromkeys(self.images, 0)
         self.move_absolute(start)
 
@@ -121,122 +56,52 @@ class Replay:
         return self.position.copy()
 
     def move_absolute(self, position):
-        if tuple(position) not in self.images:
-            raise ValueError("Replay requires an exactly recorded position")
         self.position = np.asarray(position, float)
 
     def acquire_image(self):
         key = tuple(self.position)
+        if key not in self.images:
+            raise ValueError("Replay requires an image at the exact requested position")
         paths = self.images[key]
         count = self.counts[key]
         self.counts[key] += 1
         return paths[count % len(paths)]
 
 
-def eligible_geometry(observation, settings):
-    m = observation["metrics"]
-    m1 = float(m["primary_metric"])
-    return bool(m["valid"] and np.isfinite(m1) and m1 <= settings.m2_eligibility_threshold)
+def motor_direction(image_direction):
+    """Map image right/down to motor +x/-y and return a unit motor-space vector."""
+    direction = np.asarray(image_direction, float) * [1., -1.]
+    if direction.shape != (2,) or not np.isfinite(direction).all() or np.linalg.norm(direction) == 0:
+        raise ValueError("Expected a finite nonzero image-axis direction")
+    return direction / np.linalg.norm(direction)
 
 
-def feasible(observation, settings):
-    return bool(eligible_geometry(observation, settings)
-                and np.isfinite(float(observation["metrics"]["secondary_metric"])))
+def symmetry_line(position, direction):
+    """Line n dot p = b in motor µm, anchored at the acquisition readback.
 
-
-def objective_observations(observations, settings, metric):
-    if metric == "primary_metric":
-        return [o for o in observations if np.isfinite(float(o["metrics"][metric]))]
-    return [o for o in observations if feasible(o, settings)]
-
-
-def fit_objective(observations, settings, metric="secondary_metric"):
-    """Model finite M1 or eligible M2 at the configured coordinates in motor units.
-
-    Requested coordinates assume the image was acquired at its commanded target.
-    Repeated measurements are retained for either coordinate source.
+    The image-axis intercept is detector geometry, not a motor displacement.
+    Only the mapped axis orientation is carried into motor space.
     """
-    eligible = objective_observations(observations, settings, metric)
-    if not eligible:
-        raise ValueError("Expected improvement needs an eligible observation")
-    position_key = "target" if settings.gp_position_source == "requested" else "position"
-    x = np.array([o[position_key] for o in eligible])
-    y = np.array([float(o["metrics"][metric]) for o in eligible])
-    noise = np.array([settings.gp_noise * (
-        settings.stage_2_gp_stage_1_noise_multiplier
-        if metric == "secondary_metric" and o.get("stage") in {"baseline", "stage1", "stage1_init"}
-        else 1.) for o in eligible])
-    # Repeated confirmations alone cannot identify spatial length scales.
-    fitted = len(np.unique(x, axis=0)) >= 3
-    kernel = Matern(length_scale=settings.gp_length_scale,
-                    length_scale_bounds=settings.gp_length_scale_bounds, nu=2.5)
-    gp = GaussianProcessRegressor(kernel=kernel, alpha=noise ** 2,
-                                  normalize_y=True,
-                                  optimizer="fmin_l_bfgs_b" if fitted else None)
-    gp.fit(x, y)
-    return gp, fitted
+    position, direction = np.asarray(position), np.asarray(direction)
+    normal = np.array([-direction[1], direction[0]])
+    return {"point": position.tolist(), "direction": direction.tolist(),
+            "normal": normal.tolist(), "constant": float(normal @ position)}
 
 
-def expected_improvement(gp, candidates, best_value, settings):
-    mu, std = gp.predict(np.asarray(candidates), return_std=True)
-    std = np.maximum(std, 1e-12)
-    improvement = best_value - mu - settings.ei_xi
-    z = improvement / std
-    return np.maximum(improvement * norm.cdf(z) + std * norm.pdf(z), 0)
-
-
-def candidate_grid(lo, hi, spacing):
-    """Grid anchored at the lower bounds, including both edges on each axis."""
-    axes = []
-    for a, b in zip(lo, hi):
-        axis = a + spacing * np.arange(int(np.floor((b - a) / spacing)) + 1)
-        if np.isclose(axis[-1], b, rtol=0, atol=1e-10):
-            axis[-1] = b
-        else:
-            axis = np.append(axis, b)
-        axes.append(axis)
-    return np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 2)
-
-
-def fit_quadratic(observations, settings):
-    """Least-squares M1 quadratic and its global minimum over the bounded box.
-
-    Coefficients multiply [1, u, v, u², uv, v²], with coordinates scaled to [-1, 1].
-    Corners, edge minima, and an interior stationary point cover all quadratic minima.
-    """
-    data = objective_observations(observations, settings, "primary_metric")
-    if len(data) < 6:
-        raise ValueError("Quadratic fit needs six independent finite M1 observations")
-    bounds = np.asarray(settings.bounds, float)
-    origin, scale = bounds.mean(axis=1), np.diff(bounds, axis=1).ravel() / 2
-    points = (np.array([o["position"] for o in data]) - origin) / scale
-
-    def features(points):
-        u, v = np.asarray(points).T
-        return np.column_stack([np.ones_like(u), u, v, u*u, u*v, v*v])
-
-    coefficients, _, rank, _ = np.linalg.lstsq(
-        features(points), [float(o["metrics"]["primary_metric"]) for o in data], rcond=None)
-    if rank < 6:
-        raise ValueError("Quadratic fit needs six independent finite M1 observations")
-    c = coefficients
-    candidates = [points[-1], *[(u, v) for u in (-1., 1.) for v in (-1., 1.)]]
-    for edge in (-1., 1.):
-        if c[5] > 0:
-            candidates.append([edge, np.clip(-(c[2] + c[4]*edge) / (2*c[5]), -1, 1)])
-        if c[3] > 0:
-            candidates.append([np.clip(-(c[1] + c[4]*edge) / (2*c[3]), -1, 1), edge])
-    try:
-        stationary = np.linalg.solve([[2*c[3], c[4]], [c[4], 2*c[5]]], -c[1:3])
-        if np.all(np.abs(stationary) <= 1):
-            candidates.append(stationary)
-    except np.linalg.LinAlgError:
-        pass  # A singular quadratic has a minimum among the boundary candidates.
-    candidates = np.clip(np.asarray(candidates), -1, 1)
-    predictions = features(candidates) @ c
-    best = int(np.argmin(predictions))
-    target = np.clip(origin + scale*candidates[best], bounds[:, 0], bounds[:, 1])
-    return coefficients, target, float(predictions[best])
+def intersect_lines(lines):
+    """Unweighted least-squares intersection minimizing squared perpendicular µm distances."""
+    normals = np.array([line["normal"] for line in lines])
+    positions = np.array([line["point"] for line in lines])
+    origin = positions.mean(axis=0)
+    offsets = np.einsum("ij,ij->i", normals, positions - origin)
+    delta, _, rank, singular = np.linalg.lstsq(normals, offsets, rcond=None)
+    if rank < 2:
+        raise RuntimeError("Symmetry lines are rank-deficient; no unique intersection")
+    point = origin + delta
+    residuals = normals @ delta - offsets
+    return {"position": point.tolist(), "residuals_um": residuals.tolist(),
+            "rms_distance_um": float(np.sqrt(np.mean(residuals**2))),
+            "rank": int(rank), "condition_number": float(singular[0] / singular[-1])}
 
 
 class Controller:
@@ -245,17 +110,16 @@ class Controller:
         if backend.units != settings.units:
             raise ValueError("Adapter units must match settings")
         self.s, self.backend = settings, backend
-        self.measurement = measurement if measurement is not None else partial(
-            measure, config=Config(**settings.evaluator))
+        self.measurement = measurement
+        self.evaluator = Config(**settings.evaluator)
+        self.first_image_crop = None
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive creation keeps a previous trajectory from being overwritten.
         with self.log_path.open("x"):
             pass
-        self.history, self.current, self.acquisitions = [], None, 0
-        self.best = None
-        self.length_scales = np.asarray(settings.gp_length_scale, float)
-        self.rng = np.random.default_rng(settings.seed)
+        self.history, self.lines = [], []
+        self.current, self.intersection = None, None
+        self.acquisitions = 0
         self.replay = isinstance(backend, Replay)
         self.record("start", settings=asdict(settings), replay=self.replay)
 
@@ -275,417 +139,105 @@ class Controller:
             raise RuntimeError("Readback is nonfinite or outside allowed bounds")
         return p
 
-    def move(self, target, plan, stage, *, limit_step=True):
+    def move(self, target, purpose):
         before = self.position()
         target = np.asarray(target, float)
         bounds = np.asarray(self.s.bounds)
         if (target.shape != (2,) or not np.isfinite(target).all()
-            or np.any(target < bounds[:, 0]) or np.any(target > bounds[:, 1])
-            or (limit_step and np.linalg.norm(target - before) > self.s.max_step + 1e-9)):
-            raise RuntimeError("Proposed move exceeds bounds or maximum displacement")
-        self.record("plan", text=plan, target=target.tolist(), previous_readback=before.tolist(), stage=stage)
+            or np.any(target < bounds[:, 0]) or np.any(target > bounds[:, 1])):
+            raise RuntimeError("Proposed move exceeds motor bounds")
+        self.record("plan", text=f"{purpose}: move to {target.tolist()} um.",
+                    target=target.tolist(), previous_readback=before.tolist(), purpose=purpose)
         if np.linalg.norm(target - before) > 1e-12:
             self.backend.move_absolute(target.tolist())
         actual = self.position()
         if np.linalg.norm(actual - target) > self.s.readback_tolerance:
-            raise RuntimeError("Motor readback does not match target; no recovery motion attempted")
+            raise RuntimeError("Motor readback does not match target")
+        self.record("move", previous_readback=before.tolist(), target=target.tolist(),
+                    position=actual.tolist(), purpose=purpose)
         return actual
 
-    def return_to_best(self, observation):
-        self.travel_to(observation["target"])
-
-    def best_observed(self, bo_started):
-        metric = "secondary_metric" if bo_started else "primary_metric"
-        observations = (o for o in self.history
-                        if (feasible(o, self.s) if bo_started
-                            else np.isfinite(float(o["metrics"][metric]))))
-        return min(observations, key=lambda o: float(o["metrics"][metric]), default=None)
-
-    def acquire(self, target, plan, stage):
+    def acquire(self):
         if self.acquisitions >= self.s.max_acquisitions:
             raise RuntimeError("Acquisition budget exhausted")
-        target = np.asarray(target, float)
-        actual = self.move(target, plan, stage,
-                           limit_step=stage not in {"stage1_init", "stage_2_init"})
+        before = self.position()
         self.acquisitions += 1
+        self.record("acquiring", acquisition=self.acquisitions, position=before.tolist(),
+                    text=f"Acquire image {self.acquisitions} at {before.tolist()} um.")
         image = self.backend.acquire_image()
         after = self.position()
-        if np.linalg.norm(after - actual) > self.s.readback_tolerance:
+        if np.linalg.norm(after - before) > self.s.readback_tolerance:
             raise RuntimeError("Motor position changed during acquisition")
-        obs = self.measurement(image)
-        obs.update(position=after.tolist(), target=target.tolist(), stage=stage,
-                   acquisition=self.acquisitions)
-        m = obs["metrics"]
-        description = (f"Image {obs['acquisition']} at {obs['position']}: fit "
-            f"{'valid' if m['valid'] else 'invalid'}; "
-            f"inner/outer coverage={m.get('inner_coverage', 0):.3f}/{m.get('outer_coverage', 0):.3f}; "
-            f"M1={float(m['primary_metric']):.5g}, M2={float(m['secondary_metric']):.6g}; "
-            f"Reasons: {', '.join(m['reasons']) or 'none'}.")
-        if m.get("fit") is not None:
-            description += (f" Unsupported arcs reach {m.get('inner_max_gap_degrees', float('nan')):.1f}"
-                            f" degrees inside and {m.get('outer_max_gap_degrees', float('nan')):.1f} outside."
-                            f" Hole mean={m.get('hole_mean', float('nan')):.5g}."
-                            f" Hole centroid offset={m.get('hole_centroid_offset_px', float('nan')):.3g} px.")
-        if obs.get("appearance"):
-            a = obs["appearance"]
-            description += f" Ring sector means={a['ring_sector_means']}; hole peak={a['hole_peak']}."
-        if self.current is None:
-            trend = "No preceding image."
-        else:
-            old = self.current["metrics"]
-            trend = (f"Previous M1={float(old['primary_metric']):.5g}, "
-                     f"M2={float(old['secondary_metric']):.6g}; "
-                     f"M1 {'improved' if float(m['primary_metric']) < float(old['primary_metric']) else 'unchanged or worse'}.")
-        eligible = feasible(obs, self.s)
-        if not m["valid"]:
-            rejection = "invalid fit"
-        elif not np.isfinite(float(m["primary_metric"])) or float(m["primary_metric"]) > self.s.m2_eligibility_threshold:
-            rejection = "M1 exceeds BO threshold or is nonfinite"
-        elif not np.isfinite(float(m["secondary_metric"])):
-            rejection = "nonfinite M2"
-        else:
-            rejection = None
-        obs.update(bo_eligible=eligible, bo_rejection_reason=rejection)
-        if eligible and (self.best is None or float(m["secondary_metric"]) <
-                         float(self.best["metrics"]["secondary_metric"])):
-            self.best = obs
-        next_plan = "Update measured eligibility and best position; continue the current search stage or confirm the final position."
-        self.record("observation", text=f"{description} {trend} Next: {next_plan}",
-                    observation=obs, description=description, trend=trend, next_plan=next_plan,
-                    remaining=self.s.max_acquisitions - self.acquisitions)
-        self.history.append(obs)
-        self.current = obs
-        return obs
-
-    def candidates(self, incumbent, *, initial=False):
-        p = np.array(incumbent["position"])
-        bounds = np.asarray(self.s.bounds)
-        if hasattr(self.backend, "candidate_positions"):
-            pool = np.asarray(self.backend.candidate_positions, float)
-        else:
-            lo = np.maximum(bounds[:, 0], p - self.s.stage_2_bo_halfwidth)
-            hi = np.minimum(bounds[:, 1], p + self.s.stage_2_bo_halfwidth)
-            pool = candidate_grid(lo, hi, self.s.stage_2_grid_spacing)
-        allowed = np.all((pool >= bounds[:, 0]) & (pool <= bounds[:, 1]), axis=1)
-        if not initial:
-            distance = np.linalg.norm(pool - self.position(), axis=1)
-            allowed &= ((distance <= self.s.max_step + 1e-9)
-                        & (distance >= max(1e-9, self.s.min_step - 1e-9)))
-        allowed &= np.all(np.abs(pool - p) <= np.asarray(self.s.stage_2_bo_halfwidth) + 1e-9, axis=1)
-        pool = pool[allowed]
-        if len(pool) and self.history:
-            seen = np.array([o["position"] for o in self.history])
-            pool = pool[np.min(np.linalg.norm(pool[:, None] - seen[None, :], axis=2), axis=1)
-                        >= (1e-9 if initial else max(1e-9, self.s.min_step * 0.5))]
-        rejected = [o["position"] for o in self.history
-                    if not eligible_geometry(o, self.s)]
-        if len(pool) and rejected:
-            offsets = (pool[:, None] - np.asarray(rejected)[None, :]) / self.length_scales
-            pool = pool[np.all(np.sum(offsets ** 2, axis=2) > 1., axis=1)]
-        return pool
-
-    def posterior_mean_center(self, gp, center=None):
-        """Minimize M1 globally, or M2 within the current unexcluded box."""
-        global_search = center is None
-        bounds = np.asarray(self.s.bounds)
-        center = np.clip(self.position(), bounds[:, 0], bounds[:, 1]) if global_search else np.asarray(center, float)
-        lo = bounds[:, 0] if global_search else np.maximum(bounds[:, 0], center - self.s.stage_2_bo_halfwidth)
-        hi = bounds[:, 1] if global_search else np.minimum(bounds[:, 1], center + self.s.stage_2_bo_halfwidth)
-        rejected = np.array([] if global_search else [o['position'] for o in self.history
-                             if not eligible_geometry(o, self.s)]).reshape(-1, 2)
-
-        def clearance(points):
-            offsets = (np.asarray(points)[..., None, :] - rejected) / self.length_scales
-            return np.sum(offsets ** 2, axis=-1) - 1.
-
-        def allowed(points):
-            return (np.all((points >= lo) & (points <= hi), axis=1)
-                    & np.all(clearance(points) >= -1e-8, axis=1))
-
-        if global_search and hasattr(self.backend, 'candidate_positions'):
-            # Recorded/discrete domains must be minimized at available positions.
-            pool = np.asarray(self.backend.candidate_positions, float)
-            pool = pool[allowed(pool)]
-            pool = pool[np.argsort(np.linalg.norm(pool - center, axis=1), kind='stable')]
-            return pool[np.argmin(gp.predict(pool))].copy()
-
-        grid = np.stack(np.meshgrid(*[np.linspace(a, b, 17) for a, b in zip(lo, hi)]), axis=-1).reshape(-1, 2)
-        measured = np.array([o['position'] for o in self.history]).reshape(-1, 2)
-        pool = np.vstack([center, grid, measured])
-        pool = pool[allowed(pool)]
-        if not len(pool):
-            return center.copy()
-        means = gp.predict(pool)
-        scale = float(np.ptp(means))
-        if scale == 0:
-            return pool[0].copy()
-        offset = float(np.min(means))
-
-        def objective(point):
-            return (float(gp.predict(np.asarray(point)[None, :])[0]) - offset) / scale
-
-        constraints = [{'type': 'ineq', 'fun': clearance}] if len(rejected) else []
-        refined = []
-        for start in pool[np.argsort(means, kind='stable')[:5]]:
-            result = minimize(objective, start, method='SLSQP', bounds=list(zip(lo, hi)),
-                              constraints=constraints, options={'ftol': 1e-10, 'maxiter': 100})
-            point = np.clip(result.x, lo, hi)
-            if result.success and allowed(point[None, :])[0]:
-                refined.append(point)
-        if refined:
-            pool = np.vstack([pool, refined])
-        return pool[np.argmin(gp.predict(pool))].copy()
-
-    def stage1_candidates(self, *, initial=False):
-        """Propose throughout the global bounds without geometry exclusions."""
-        bounds = np.asarray(self.s.bounds)
-        pool = (np.asarray(self.backend.candidate_positions, float)
-                if hasattr(self.backend, "candidate_positions") else
-                candidate_grid(bounds[:, 0], bounds[:, 1], self.s.stage_1_grid_spacing))
-        allowed = np.all((pool >= bounds[:, 0]) & (pool <= bounds[:, 1]), axis=1)
-        pool = pool[allowed]
-        if len(pool) and self.history:
-            seen = np.array([o["position"] for o in self.history])
-            pool = pool[np.min(np.linalg.norm(pool[:, None] - seen[None, :], axis=2), axis=1)
-                        >= (1e-9 if initial else max(1e-9, self.s.min_step))]
-        if not initial and self.replay and len(pool):
-            reachable, _ = self.replay_routes()
-            pool = pool[[tuple(p) in reachable for p in pool]]
-        return pool
-
-    def initialization_grid(self, center=None):
-        """Sixteen regular locations spanning the global or clipped entry box."""
-        bounds = np.asarray(self.s.bounds)
-        lo, hi = bounds[:, 0], bounds[:, 1]
-        if center is not None:
-            lo = np.maximum(lo, np.asarray(center) - self.s.stage_2_bo_halfwidth)
-            hi = np.minimum(hi, np.asarray(center) + self.s.stage_2_bo_halfwidth)
-        grid = np.stack(np.meshgrid(*[np.linspace(a, b, 4) for a, b in zip(lo, hi)],
-                                   indexing="ij"), axis=-1).reshape(-1, 2)
-        if hasattr(self.backend, "candidate_positions"):
-            available = np.asarray(self.backend.candidate_positions)
-            if not all(np.any(np.all(available == point, axis=1)) for point in grid):
-                raise ValueError("Initialization grid requires all 16 locations to be available in the backend")
-        return grid
-
-    def replay_routes(self):
-        """Find recorded waypoints reachable by moves no longer than max_step."""
-        bounds = np.asarray(self.s.bounds)
-        points = np.asarray(self.backend.candidate_positions, float)
-        points = points[np.all((points >= bounds[:, 0]) & (points <= bounds[:, 1]), axis=1)]
-        start = tuple(self.position())
-        parents, queue = {start: None}, [start]
-        for point in queue:
-            distances = np.linalg.norm(points - point, axis=1)
-            for neighbor in points[distances <= self.s.max_step + 1e-9]:
-                key = tuple(neighbor)
-                if key not in parents:
-                    parents[key] = point
-                    queue.append(key)
-        return parents.keys(), parents
-
-    def travel_to(self, target):
-        """Reach a global BO target using bounded transit moves without images."""
-        target = np.asarray(target, float)
-        if self.replay:
-            _, parents = self.replay_routes()
-            key, path = tuple(target), []
-            if key not in parents:
-                raise RuntimeError("No bounded replay path to target")
-            while parents[key] is not None:
-                path.append(key)
-                key = parents[key]
-            for waypoint in reversed(path):
-                self.move(waypoint, "Bounded replay transit to BO target.", "transit")
-        else:
-            distance = np.linalg.norm(target - self.position())
-            while distance > self.s.max_step:
-                before = self.position()
-                waypoint = before + (target - before) * (self.s.max_step / distance)
-                actual = self.move(waypoint, "Bounded transit to BO target.", "transit")
-                remaining = np.linalg.norm(target - actual)
-                if remaining >= distance:
-                    raise RuntimeError("Transit made no progress")
-                distance = remaining
-            self.move(target, "Reach BO target.", "transit")
+        try:
+            if self.measurement is None:
+                observation = measure(image, config=self.evaluator, first_image_crop=self.first_image_crop)
+                if not self.evaluator.crop_xyxy and self.first_image_crop is None:
+                    self.first_image_crop = observation["metrics"]["crop_xyxy"]
+            else:
+                observation = self.measurement(image)
+        except Exception as exc:
+            observation = {"image": str(image), "metrics": {
+                "valid": False, "fit": None, "error": str(exc), "reasons": [str(exc)],
+                "config": asdict(self.evaluator),
+                "crop_xyxy": list(self.evaluator.crop_xyxy or self.first_image_crop or ())}}
+        observation.update(position=after.tolist(), acquisition=self.acquisitions,
+                           stage="search", line=None)
+        metrics = observation["metrics"]
+        if not metrics.get("error"):
+            direction = motor_direction(metrics["direction_xy"])
+            observation["motor_direction"] = direction.tolist()
+            if metrics["valid"]:
+                line = symmetry_line(after, direction)
+                line["acquisition"] = self.acquisitions
+                observation["line"] = line
+                self.lines.append(line)
+        observation["valid_axes_count"] = len(self.lines)
+        self.history.append(observation)
+        self.current = observation
+        state = "failed" if metrics.get("error") else "accepted" if metrics["valid"] else "rejected"
+        self.record("observation", observation=observation,
+                    text=f"Image {self.acquisitions}: axis {state}; {len(self.lines)}/{self.s.valid_axes_required} valid axes. "
+                         + "; ".join(metrics.get("reasons", [])))
+        return observation
 
     def run(self):
-        incumbent, reason, status = None, "budget exhausted", "best_found"
-        bo_started = False
+        status, reason = "blocked", ""
         try:
-            bounds = np.asarray(self.s.bounds)
-            grid_mode = self.s.bo_initialization == "grid"
-            stage1_grid = self.initialization_grid() if grid_mode else None
-            stage1_grid_count, stage2_grid_count = 0, 0
-            baseline_target = np.clip(self.position(), bounds[:, 0], bounds[:, 1])
-            incumbent = self.acquire(baseline_target, "Acquire baseline before choosing a move.", "baseline")
-            stage, initial_samples = "stage1", 0
-            while self.acquisitions < self.s.max_acquisitions - self.s.confirmations:
-                primary_best = self.best_observed(False)
-                if stage == "stage1":
-                    if grid_mode and stage1_grid_count < len(stage1_grid):
-                        self.acquire(stage1_grid[stage1_grid_count],
-                                     f"Measure M1 initialization grid location {stage1_grid_count + 1}/16.", "stage1_init")
-                        stage1_grid_count += 1
-                        continue
-                    quadratic = self.s.stage_1_optimizer == "quadratic"
-                    if quadratic:
-                        coefficients, stage2_center, predicted_m1 = fit_quadratic(self.history, self.s)
-                        prediction = {"quadratic_minimum_m1": predicted_m1}
-                        self.record("quadratic_model", stage=stage, coefficients=coefficients.tolist(),
-                                    coordinate_system="bounds normalized to [-1, 1]",
-                                    terms=["1", "u", "v", "u^2", "uv", "v^2"],
-                                    training_acquisitions=[o["acquisition"] for o in
-                                        objective_observations(self.history, self.s, "primary_metric")],
-                                    position=stage2_center.tolist(), **prediction)
-                    else:
-                        gp, fitted = fit_objective(self.history, self.s, "primary_metric")
-                        self.record("bo_model", stage=stage, objective="primary_metric",
-                                    length_scales=np.asarray(gp.kernel_.length_scale).tolist(),
-                                    length_scales_fitted=fitted, training_count=len(gp.X_train_),
-                                    training_acquisitions=[o["acquisition"] for o in
-                                        objective_observations(self.history, self.s, "primary_metric")],
-                                    exclusion_acquisitions=[])
-                    if grid_mode or self.acquisitions >= self.s.bo_initial_samples:
-                        if not quadratic:
-                            stage2_center = self.posterior_mean_center(gp)
-                            predicted_m1 = float(gp.predict(stage2_center[None, :])[0])
-                            prediction = {"posterior_mean_m1": predicted_m1}
-                        threshold_met = not quadratic and predicted_m1 <= self.s.stage_2_entrance_m1
-                        budget_met = self.acquisitions >= self.s.stage_1_max_acquisitions
-                        self.record("stage_2_entry_check", position=stage2_center.tolist(),
-                                    threshold_met=threshold_met,
-                                    stage1_acquisitions=self.acquisitions, **prediction)
-                        if threshold_met or budget_met:
-                            stage, bo_started = "stage_2", True
-                            self.record("stage_transition", stage=stage, from_stage="stage1",
-                                        reason="M1 posterior mean threshold reached" if threshold_met else "stage 1 budget exhausted",
-                                        stage1_acquisitions=self.acquisitions,
-                                        position=stage2_center.tolist(), **prediction)
-                            self.record("search_box", stage=stage, center=stage2_center.tolist(),
-                                        centering="initialization_anchor")
-                            if grid_mode:
-                                stage2_grid = self.initialization_grid(stage2_center)
-                            acquisition_stage = "stage_2_init" if grid_mode or self.s.bo_initial_samples else "stage_2"
-                            if acquisition_stage == "stage_2":
-                                self.travel_to(stage2_center)
-                            entry_model = "quadratic" if quadratic else "posterior mean"
-                            obs = self.acquire(stage2_center, f"Measure Stage 2 entry at the M1 {entry_model} minimum.",
-                                               acquisition_stage)
-                            if acquisition_stage == "stage_2_init" and feasible(obs, self.s):
-                                initial_samples += 1
-                            continue
-                    if quadratic:
-                        self.travel_to(stage2_center)
-                        self.acquire(stage2_center, "Measure the refitted M1 quadratic minimum.", "stage1")
-                        continue
-                    random_initializing = not grid_mode and self.acquisitions < self.s.bo_initial_samples
-                    pool = self.stage1_candidates(initial=random_initializing)
-                    if not len(pool):
-                        # A discrete or very small domain can be fully sampled before the budget.
-                        trial = np.asarray(primary_best["target"])
-                        plan, acquisition_stage = "Reimage best M1 after exhausting distinct Stage 1 candidates.", "stage1"
-                    elif random_initializing:
-                        trial = pool[self.rng.integers(len(pool))]
-                        plan, acquisition_stage = f"Move directly to random M1 initialization target {trial.tolist()}.", "stage1_init"
-                    else:
-                        scores = expected_improvement(gp, pool, float(primary_best["metrics"]["primary_metric"]), self.s)
-                        trial = pool[np.argmax(scores)]
-                        plan, acquisition_stage = f"Global M1 BO trial; EI={scores.max():.5g}.", "stage1"
-                    if acquisition_stage != "stage1_init":
-                        self.travel_to(trial)
-                    self.acquire(trial, plan, acquisition_stage)
-                    continue
-
-                # Stage 2 can start on budget exhaustion before any eligible M2 exists.
-                incumbent = self.best or primary_best
-                if grid_mode and stage2_grid_count < len(stage2_grid):
-                    self.record("search_box", stage="stage_2", center=stage2_center.tolist(),
-                                centering="initialization_anchor")
-                    obs = self.acquire(stage2_grid[stage2_grid_count],
-                                       f"Measure M2 initialization grid location {stage2_grid_count + 1}/16.", "stage_2_init")
-                    stage2_grid_count += 1
-                    if feasible(obs, self.s):
-                        initial_samples += 1
-                    continue
-                if (self.best is not None and self.s.stage_2_target_m2 is not None
-                    and float(self.best["metrics"]["secondary_metric"]) <= self.s.stage_2_target_m2):
-                    reason = "requested metric target reached"
+            while self.acquisitions < self.s.max_acquisitions:
+                observation = self.acquire()
+                metrics = observation["metrics"]
+                if metrics.get("error"):
+                    raise RuntimeError(metrics["error"])
+                if len(self.lines) == self.s.valid_axes_required:
+                    self.intersection = intersect_lines(self.lines)
+                    self.record("intersection", intersection=self.intersection,
+                                text=f"Least-squares intersection: {self.intersection['position']} um.")
+                    self.move(self.intersection["position"], "Move to symmetry intersection")
+                    status, reason = "aligned", "Moved to the least-squares symmetry intersection"
                     break
-                gp = None
-                if self.best is not None:
-                    gp, fitted = fit_objective(self.history, self.s)
-                    self.length_scales = np.asarray(gp.kernel_.length_scale)
-                    self.record("bo_model", stage="stage_2", objective="secondary_metric",
-                                length_scales=self.length_scales.tolist(),
-                                length_scales_fitted=fitted, training_count=len(gp.X_train_),
-                                training_acquisitions=[o["acquisition"] for o in self.history if feasible(o, self.s)],
-                                initial_samples=initial_samples,
-                                exclusion_acquisitions=[o["acquisition"] for o in self.history
-                                    if not eligible_geometry(o, self.s)])
-                if grid_mode and gp is None:
-                    reason = "grid initialization completed without eligible M2 observations"
+                if self.acquisitions == self.s.max_acquisitions:
+                    status, reason = "acquisition_limit", "Acquisition limit reached before collecting enough valid axes"
                     break
-                initializing = not grid_mode and (initial_samples < self.s.bo_initial_samples or gp is None)
-                if not initializing:
-                    stage2_center = self.posterior_mean_center(gp, stage2_center)
-                self.record("search_box", stage="stage_2", center=stage2_center.tolist(),
-                            centering="initialization_anchor" if initializing else "posterior_mean")
-                pool = self.candidates({'position': stage2_center}, initial=initializing)
-                if not len(pool):
-                    reason = "no sampleable candidates after travel, spacing, and M1 exclusions"
-                    if initializing:
-                        reason += "; random initialization incomplete"
-                    break
-                if initializing:
-                    trial = pool[self.rng.integers(len(pool))]
-                    plan = (f"Move directly to random M2 initialization target {trial.tolist()}; "
-                            f"{initial_samples + 1}/{self.s.bo_initial_samples} eligible locations.")
-                    acquisition_stage = "stage_2_init"
+                direction = np.array(observation["motor_direction"])
+                if metrics["valid"]:
+                    step = np.array([direction[1], -direction[0]]) * self.s.lateral_step_um
+                    purpose = "Accepted axis: move to its 3 o'clock side"
                 else:
-                    scores = expected_improvement(gp, pool, float(incumbent["metrics"]["secondary_metric"]), self.s)
-                    if scores.max() <= self.s.stage_2_min_ei:
-                        reason = "expected improvement below threshold"
-                        break
-                    trial = pool[np.argmax(scores)]
-                    plan = f"Local M2 BO trial at {trial.tolist()}; EI={scores.max():.5g}."
-                    acquisition_stage = "stage_2"
-                obs = self.acquire(trial, plan, acquisition_stage)
-                if acquisition_stage == "stage_2_init" and feasible(obs, self.s):
-                    initial_samples += 1
-            if not grid_mode and stage == "stage_2" and initial_samples < self.s.bo_initial_samples and reason == "budget exhausted":
-                reason = "random initialization budget exhausted"
-            incumbent = self.best_observed(bo_started) or self.best_observed(False) or incumbent
-            self.return_to_best(incumbent)
-            # Final repeated acquisitions count toward the same budget.
-            confirmations = []
-            for _ in range(self.s.confirmations):
-                if self.acquisitions >= self.s.max_acquisitions:
-                    break
-                obs = self.acquire(incumbent["target"], "Reimage final position to check metric stability.", "final")
-                confirmations.append(obs)
-            stable = len(confirmations) == self.s.confirmations and all(feasible(o, self.s) for o in confirmations)
-            if stable and self.s.stage_2_target_m2 is not None and all(
-                float(o["metrics"]["secondary_metric"]) <= self.s.stage_2_target_m2 for o in confirmations):
-                status = "metric_target_reached"
-            elif not stable:
-                status = "unconfirmed"
-                reason += "; final geometry confirmation failed"
-            elif reason == "requested metric target reached":
-                reason = "M2 target not sustained during final confirmation"
+                    step = -direction * self.s.reverse_step_um
+                    purpose = "Rejected axis: move opposite its brightness direction"
+                self.move(np.array(observation["position"]) + step, purpose)
         except Exception as exc:
-            status, reason = "blocked", f"{type(exc).__name__}: {exc}"
+            reason = f"{type(exc).__name__}: {exc}"
             self.record("fault", text=reason)
-        best = self.best_observed(bo_started) or self.best_observed(False)
         try:
             final_position = self.position().tolist()
         except Exception:
             final_position = None
         result = {"status": status, "reason": reason, "replay": self.replay,
-                  "acquisitions": self.acquisitions, "best_observed": best,
+                  "acquisitions": self.acquisitions, "valid_axes_count": len(self.lines),
+                  "lines": self.lines, "intersection": self.intersection,
                   "final_observation": self.current, "final_readback": final_position,
-                  "log": str(self.log_path),
-                  "qualification": "Metric convergence only; validate local hole defects and hardware behavior independently."}
+                  "log": str(self.log_path)}
         self.record("complete", text=f"Stopped: {status}; {reason}.", result=result)
         return result
 
@@ -730,7 +282,7 @@ def main():
     finally:
         if dashboard is not None:
             dashboard.close()
-    if result["status"] == "blocked":
+    if result["status"] != "aligned":
         raise SystemExit(2)
 
 

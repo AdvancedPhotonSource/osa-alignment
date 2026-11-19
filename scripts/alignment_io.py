@@ -30,27 +30,7 @@ def load_manifest(path):
     return data
 
 
-def measure(path, *, config=None):
+def measure(path, *, config=None, first_image_crop=None):
     image = read_image(path)
-    result = evaluate(image, Config() if config is None else config)
-    appearance = {}
-    if result.get("fit") is not None:
-        fit = result["fit"]
-        y, x = np.indices(image.shape)
-        dx, dy = x - fit["center_x"], y - fit["center_y"]
-        angle = np.deg2rad(fit["angle_degrees"])
-        u = dx * np.cos(angle) + dy * np.sin(angle)
-        v = -dx * np.sin(angle) + dy * np.cos(angle)
-        inner, outer = fit["inner_axes"], fit["outer_axes"]
-        hole = (u / inner[0]) ** 2 + (v / inner[1]) ** 2 <= 1
-        annulus = ((u / outer[0]) ** 2 + (v / outer[1]) ** 2 <= 1) & ~hole
-        sectors = {"left": (dx < 0) & (abs(dx) >= abs(dy)),
-                   "right": (dx >= 0) & (abs(dx) >= abs(dy)),
-                   "top": (dy < 0) & (abs(dy) > abs(dx)),
-                   "bottom": (dy >= 0) & (abs(dy) > abs(dx))}
-        appearance = {"ring_sector_means": {
-            name: float(image[mask & annulus].mean()) if (mask & annulus).any() else None
-            for name, mask in sectors.items()},
-            "hole_peak": float(image[hole].max()) if hole.any() else None}
-    return {"image": str(path), "metrics": result,
-            "appearance": appearance}
+    result = evaluate(image, Config() if config is None else config, first_image_crop=first_image_crop)
+    return {"image": str(Path(path).resolve()), "metrics": result}
