@@ -125,13 +125,13 @@ def axis_segment(point, direction, shape):
     return low, high
 
 
-def directed_axis(image, point, direction):
+def directed_axis(image, point, direction, *, require_direction=True):
     """Orient a fitted axis by the slope of raw intensity versus signed distance.
 
     Bilinear samples span its full in-crop segment at <=1-pixel spacing. Ordinary
     least squares fits I(t)=slope*t+intercept; positive slope keeps the supplied
     direction and negative slope reverses it. A numerically flat profile has no
-    defined direction and stops the workflow.
+    defined brightness direction. An accepted line can still guide a perpendicular step.
     """
     point, direction = np.asarray(point), np.asarray(direction)
     low, high = axis_segment(point, direction, image.shape)
@@ -141,9 +141,12 @@ def directed_axis(image, point, direction):
     centered = t - t.mean()
     slope = float(centered @ (values - values.mean()) / (centered @ centered))
     numerical_floor = 64 * np.finfo(float).eps * max(1., float(np.max(np.abs(values))))
+    brightness_direction = (direction if slope > 0 else -direction).tolist()
     if abs(slope) * (high - low) <= numerical_floor:
-        raise ValueError("Along-axis intensity slope is zero; direction is undefined")
-    return {"direction_xy": (direction if slope > 0 else -direction).tolist(),
+        if require_direction:
+            raise ValueError("Along-axis intensity slope is zero; direction is undefined")
+        brightness_direction = None
+    return {"direction_xy": brightness_direction,
             "profile_slope_intensity_per_px": slope,
             "profile_intercept": float(values.mean() - slope * t.mean()),
             "profile_distance_px": t.tolist(), "profile_intensity": values.tolist()}
@@ -174,14 +177,15 @@ def evaluate(image, config=Config(), *, first_image_crop=None):
         fit = analysis["best_axis"]
         result.update(fit=fit, centroid_xy_px=analysis["centroid_xy_px"],
                       fft_score_range=analysis["fft_score_range"], candidates=analysis["candidates"])
-        directed = directed_axis(patch, fit["axis_point_xy_px"], fit["axis_direction_xy"])
-        result.update(directed)
         a, b = fit["mismatch"], fit["perpendicular_mismatch"]
         relative = abs(b - a) / max(a, b) if max(a, b) > 0 else 0.
         result.update(reflection_mismatch=a, perpendicular_mismatch=b, relative_mismatch_difference=relative)
         gap = fit["d_perp"] - fit["d_axis"]
         result.update(d_axis=fit["d_axis"], d_perp=fit["d_perp"], intensity_gap=gap)
-        result["valid"] = gap > config.mismatch_relative_tolerance
+        valid = gap > config.mismatch_relative_tolerance
+        result.update(directed_axis(patch, fit["axis_point_xy_px"], fit["axis_direction_xy"],
+                                    require_direction=not valid))
+        result["valid"] = valid
         if not result["valid"]:
             result["reasons"].append("Signed intensity gap is at or below the acceptance threshold")
     except (ValueError, RuntimeError) as exc:

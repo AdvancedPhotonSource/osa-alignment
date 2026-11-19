@@ -25,6 +25,7 @@ class Settings:
     lateral_step_um: float = 5.
     max_acquisitions: int = 20
     readback_tolerance: float = 0.001
+    beta: float = 0.5
 
     def validate(self):
         bounds = np.asarray(self.bounds, float)
@@ -36,6 +37,8 @@ class Settings:
         values = [self.reverse_step_um, self.lateral_step_um, self.readback_tolerance]
         if not np.isfinite(values).all() or min(values) <= 0:
             raise ValueError("Step distances and readback_tolerance must be finite and positive")
+        if not 0 < self.beta <= 1:
+            raise ValueError("Momentum weight beta must be in (0, 1]")
         if (type(self.valid_axes_required) is not int or type(self.max_acquisitions) is not int
             or not 2 <= self.valid_axes_required <= self.max_acquisitions):
             raise ValueError("Require 2 <= valid_axes_required <= max_acquisitions")
@@ -118,6 +121,7 @@ class Controller:
         with self.log_path.open("x"):
             pass
         self.history, self.lines = [], []
+        self.momentum = np.zeros(2)
         self.current, self.intersection = None, None
         self.acquisitions = 0
         self.replay = isinstance(backend, Replay)
@@ -158,6 +162,23 @@ class Controller:
                     position=actual.tolist(), purpose=purpose)
         return actual
 
+    def accept_axis(self, observation, position, direction):
+        """Orient the motor axis so its clockwise normal follows accepted-readback momentum (µm)."""
+        lateral = np.array([direction[1], -direction[0]])
+        if self.lines:
+            delta = position - self.lines[-1]["point"]
+            beta = self.s.beta
+            self.momentum = (1 - beta) * self.momentum + beta * delta
+            projection = lateral @ self.momentum
+            # Break an exact tie consistently for either representation of the same line.
+            if projection < 0 or (projection == 0 and tuple(lateral) < (0., 0.)):
+                direction, lateral = -direction, -lateral
+        line = symmetry_line(position, direction)
+        line["acquisition"] = self.acquisitions
+        self.lines.append(line)
+        observation.update(line=line, motor_direction=direction.tolist(),
+                           lateral_direction=lateral.tolist(), momentum_um=self.momentum.tolist())
+
     def acquire(self):
         if self.acquisitions >= self.s.max_acquisitions:
             raise RuntimeError("Acquisition budget exhausted")
@@ -185,13 +206,13 @@ class Controller:
                            stage="search", line=None)
         metrics = observation["metrics"]
         if not metrics.get("error"):
-            direction = motor_direction(metrics["direction_xy"])
-            observation["motor_direction"] = direction.tolist()
+            image_axis = metrics.get("direction_xy")
             if metrics["valid"]:
-                line = symmetry_line(after, direction)
-                line["acquisition"] = self.acquisitions
-                observation["line"] = line
-                self.lines.append(line)
+                if image_axis is None:
+                    image_axis = metrics["fit"]["axis_direction_xy"]
+                self.accept_axis(observation, after, motor_direction(image_axis))
+            else:
+                observation["motor_direction"] = motor_direction(image_axis).tolist()
         observation["valid_axes_count"] = len(self.lines)
         self.history.append(observation)
         self.current = observation
@@ -219,12 +240,11 @@ class Controller:
                 if self.acquisitions == self.s.max_acquisitions:
                     status, reason = "acquisition_limit", "Acquisition limit reached before collecting enough valid axes"
                     break
-                direction = np.array(observation["motor_direction"])
                 if metrics["valid"]:
-                    step = np.array([direction[1], -direction[0]]) * self.s.lateral_step_um
-                    purpose = "Accepted axis: move to its 3 o'clock side"
+                    step = np.array(observation["lateral_direction"]) * self.s.lateral_step_um
+                    purpose = "Accepted axis: move along selected perpendicular"
                 else:
-                    step = -direction * self.s.reverse_step_um
+                    step = -np.array(observation["motor_direction"]) * self.s.reverse_step_um
                     purpose = "Rejected axis: move opposite its brightness direction"
                 self.move(np.array(observation["position"]) + step, purpose)
         except Exception as exc:

@@ -68,7 +68,9 @@ line, at spacing no larger than one pixel, using bilinear interpolation. Fit
 `intensity = slope * signed_distance + intercept` with ordinary least squares.
 Choose the sign of the axis vector so fitted intensity increases in that
 direction. The slope is measured in intensity units per pixel. A numerically
-zero slope leaves the direction undefined and stops the run.
+zero slope leaves the brightness direction undefined. A rejected axis needs
+that direction for its reverse move. An accepted axis can use the fitted line
+orientation for lateral steering.
 
 Image direction `(ux, uy)` maps to unit motor direction `(ux, -uy)`. In motor
 coordinates, the 3 o'clock direction is `(vy, -vx)` for directed axis `(vx, vy)`.
@@ -84,8 +86,25 @@ converted into a motor displacement.
 ## Search and intersection
 
 Acquire one image at the starting readback. After an ambiguous-axis rejection,
-move `-reverse_step_um * v`. After acceptance, store the line and, if more lines
-are required, move `lateral_step_um * (vy, -vx)`. Reacquire after each search move.
+move opposite the measured brightness direction by `reverse_step_um`. On the
+first accepted image, seed the lateral direction with the clockwise perpendicular
+to the brightness direction, using the fitter's axis orientation if the profile
+is flat. Start with zero motor-space momentum (µm). At each subsequent accepted
+readback \(p_i\), update it using the preceding accepted readback:
+
+\[
+m_i=(1-\beta)m_{i-1}+\beta(p_i-p_{i-1}).
+\]
+
+The displacement includes the net travel across intervening rejected images
+and reflects any motor-bound clipping. Select the unit perpendicular with the
+larger dot product with \(m_i\). For an exact tie, choose positive motor x, or
+positive y for a vertical perpendicular. Accepted observations record
+`momentum_um`, the selected `lateral_direction`, and the `motor_direction`
+whose clockwise perpendicular gives that lateral direction. The image overlay
+shows the measured brightness direction when available. If more lines are
+required, propose `lateral_step_um * lateral_direction` and reacquire after
+the bounded move.
 As soon as the required line count is reached, solve
 
 \[
@@ -114,7 +133,8 @@ intersection move and readback verification.
 | `bounds` | required | Absolute `[x_min,x_max]`, `[y_min,y_max]` |
 | `valid_axes_required` | 6 | Number of accepted lines before solving; at least 2 |
 | `reverse_step_um` | 5 | Reverse-axis displacement after rejection |
-| `lateral_step_um` | 5 | Clockwise perpendicular displacement after acceptance |
+| `lateral_step_um` | 5 | Perpendicular displacement after acceptance. The bundled configuration sets 15 µm. |
+| `beta` | 0.5 | Weight of the newest accepted-readback displacement in the momentum update, in (0, 1] |
 | `max_acquisitions` | 20 | Total acquisition limit, including the starting image; at least the required line count |
 | `readback_tolerance` | 0.001 | Euclidean target/readback and acquisition-drift tolerance in µm; also permits this per-axis margin when reading global bounds |
 | `evaluator.crop_xyxy` | `[276,73,616,413]` | Integer exclusive detector bounds, or `[]` / `null` for automatic cropping |
@@ -128,7 +148,7 @@ intersection move and readback verification.
 
 The bundled configuration retains the instrument's existing readback tolerance
 of 10 µm; set this to the tolerance appropriate for the actual motor readbacks.
-The bundled bounds are `[-30,30]` on both axes. Settings are recorded in the log.
+The bundled bounds are `[-15,15]` on both axes. Settings are recorded in the log.
 
 ## Adapter interface and APS 2-ID-D QueueServer adapter
 

@@ -55,8 +55,10 @@ def test_defaults_and_configuration():
     s=Settings('um',[[-30,30],[-30,30]])
     s.validate()
     assert (s.valid_axes_required,s.max_acquisitions,s.reverse_step_um,s.lateral_step_um)==(6,20,5,5)
+    assert s.beta == .5
     for changes in ({'valid_axes_required':1},{'max_acquisitions':1},{'reverse_step_um':0},
-                    {'lateral_step_um':float('nan')},{'units':'mm'},{'bounds':[[1,0],[0,1]]}):
+                    {'lateral_step_um':float('nan')},{'units':'mm'},{'bounds':[[1,0],[0,1]]},
+                    {'beta':0},{'beta':1.01},{'beta':float('nan')}):
         with pytest.raises(ValueError): settings(**changes).validate()
     with pytest.raises(TypeError): settings(stage_1_optimizer='bo')
 
@@ -77,6 +79,31 @@ def test_configured_step_distances(tmp_path):
               reverse_step_um=7,lateral_step_um=3)
     np.testing.assert_allclose(b.moves,[[-7,0],[-4,0],[-7,-3]],atol=1e-12)
     assert r['status']=='aligned'
+
+
+def test_momentum_uses_consecutive_accepted_readbacks(tmp_path):
+    flat = observation()
+    flat['metrics'].update(direction_xy=None, fit={'axis_direction_xy':[1,0]})
+    c,b,r = run(tmp_path,[observation((0,-1)), observation((0,1),valid=False),
+                          observation((0,1)), flat, observation()],
+                bounds=[[-3,3],[-20,20]], valid_axes_required=4, beta=.25)
+    assert r['status']=='aligned'
+    first,rejected,second,third,last = c.history
+    assert 'momentum_um' not in rejected
+    np.testing.assert_allclose([o['position'] for o in c.history],[[0,0],[3,0],[3,5],[3,5],[3,10]])
+    np.testing.assert_allclose([o['momentum_um'] for o in (first,second,third,last)],
+                               [[0,0],[.75,1.25],[.5625,.9375],[.421875,1.953125]])
+    np.testing.assert_allclose(second['lateral_direction'],[1,0])
+    np.testing.assert_allclose(third['lateral_direction'],[0,1])
+
+
+@pytest.mark.parametrize('axis', [(1,0),(-1,0)])
+def test_momentum_tie_is_independent_of_brightness_sign(tmp_path,axis):
+    c,_,r = run(tmp_path,[observation((0,-1)),observation(axis),observation()],
+                valid_axes_required=3,beta=1.)
+    assert r['status']=='aligned'
+    np.testing.assert_allclose(c.history[1]['momentum_um'],[5,0])
+    np.testing.assert_allclose(c.history[1]['lateral_direction'],[0,1])
 
 
 def test_line_anchor_uses_actual_readback(tmp_path):

@@ -100,6 +100,8 @@ def test_direction_is_ols_slope_on_raw_profile():
         assert abs(result['profile_slope_intensity_per_px'])==pytest.approx(2)
     with pytest.raises(ValueError,match='undefined'):
         directed_axis(np.ones((32,40)),[12,10],[1,0])
+    flat = directed_axis(np.ones((32,40)), [12,10], [1,0], require_direction=False)
+    assert flat['direction_xy'] is None
 
 
 def test_axis_segment_vertical_and_outside():

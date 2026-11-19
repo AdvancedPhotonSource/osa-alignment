@@ -2,18 +2,19 @@
   "units": "um",
   "bounds": [
     [
-      -30.0,
-      30.0
+      -15.0,
+      15.0
     ],
     [
-      -30.0,
-      30.0
+      -15.0,
+      15.0
     ]
   ],
   "max_acquisitions": 20,
   "valid_axes_required": 6,
   "reverse_step_um": 5,
-  "lateral_step_um": 5,
+  "lateral_step_um": 15,
+  "beta": 0.5,
   "readback_tolerance": 10,
   "evaluator": {
     "crop_xyxy": [276, 73, 616, 413],

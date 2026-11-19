@@ -16,16 +16,18 @@ Motor positions and step distances are in micrometers.
    brightness-reflection axis using polar angular FFT self-convolution, then
    refine its angle and perpendicular displacement locally.
 2. Sample the original pixel intensities along the fitted axis and fit a line
-   against signed pixel distance. Orient the axis toward increasing fitted
-   intensity.
+   against signed pixel distance to measure the brightness direction.
 3. Compute the absolute reflection residual for the fitted axis and its
    perpendicular through the closest axis point to the intensity centroid.
    Normalize each residual sum by twice the smoothed crop's integrated intensity.
    Reject if `D_perp − D_axis <= mismatch_relative_tolerance` (default 0.10).
    After rejection, move opposite the directed axis by `reverse_step_um` (default 5).
 4. For an accepted axis, store a motor-space line through the acquisition's
-   actual readback, oriented by the mapped image axis. Move to the axis's
-   3 o'clock side by `lateral_step_um` (default 5).
+   actual readback. The first accepted axis seeds the lateral move on the
+   clockwise side of the brightness direction. From the second accepted axis
+   onward, update momentum using successive accepted readback displacements
+   (exponential weight `beta`, default 0.5). Choose the perpendicular that
+   points along that momentum and move `lateral_step_um` (bundled value 15 µm).
 5. As soon as `valid_axes_required` lines have been stored (default 6), solve
    their unweighted least-squares intersection and use it as the move target. This
    replaces the lateral move after the last required axis and completes the run.
